@@ -3,6 +3,7 @@ import json
 import re
 import subprocess
 import time
+from pathlib import Path
 import datetime
 
 # script to benchmark speculative cascades against baselines - runs mlx_lm.generate as a subprocess to ensure clean memory state for each run
@@ -22,7 +23,6 @@ def run_benchmark_command(command: list[str]) -> dict:
 
     start_time = time.time()
     try:
-        # prevent hanging on a broken implementation
         result = subprocess.run(
             command,
             stdout=subprocess.PIPE,
@@ -31,7 +31,6 @@ def run_benchmark_command(command: list[str]) -> dict:
             check=True,
             timeout=1800,
         )
-        # Now stdout contains both the model output and the debug messages
         full_output = result.stdout
 
         # generated output and any debug info
@@ -39,28 +38,55 @@ def run_benchmark_command(command: list[str]) -> dict:
         print(full_output)
         print("------------------------------------------------\n")
 
+        lines = full_output.strip().split('\n')
 
         # parse performance metrics from stdout
-        lines = full_output.strip().split('\n')
-        gen_line = next((line for line in reversed(lines) if "Generation" in line), None)
-        mem_line = next((line for line in reversed(lines) if "Peak memory" in line), None)
+        prompt_metrics = None
+        gen_metrics = None
+        mem_metrics = None
 
-        if not gen_line or not mem_line:
-            raise ValueError("Could not parse performance metrics from output.")
+        prompt_pattern = re.compile(r"Prompt:\s+(\d+)\s+tokens,\s+([\d\.]+)\s+tokens-per-sec")
+        gen_pattern = re.compile(r"Generation:\s+(\d+)\s+tokens,\s+([\d\.]+)\s+tokens-per-sec")
+        mem_pattern = re.compile(r"Peak memory:\s+([\d\.]+)\s+GB")
+
+        for line in reversed(lines):
+            if gen_metrics is None:
+                gen_match = gen_pattern.search(line)
+                if gen_match:
+                    gen_metrics = {
+                        "generation_tokens": int(gen_match.group(1)),
+                        "generation_tok_per_sec": float(gen_match.group(2))
+                    }
+                    continue
+            if prompt_metrics is None:
+                prompt_match = prompt_pattern.search(line)
+                if prompt_match:
+                    prompt_metrics = {
+                        "prompt_tokens": int(prompt_match.group(1)),
+                        "prompt_tok_per_sec": float(prompt_match.group(2))
+                    }
+                    continue
+            if mem_metrics is None:
+                mem_match = mem_pattern.search(line)
+                if mem_match:
+                    mem_metrics = {
+                        "peak_memory_gb": float(mem_match.group(1))
+                    }
+                    continue
+
+        if not gen_metrics or not prompt_metrics or not mem_metrics:
+            raise ValueError("Could not parse all required performance metrics from output.")
 
         # get the main text output, ignoring debug lines
         output_text_lines = []
         in_main_output = False
         for line in lines:
             if "==========" in line:
-                in_main_output = not in_main_output # Toggle state
+                in_main_output = not in_main_output
                 continue
             if in_main_output and not line.strip().startswith("[DEBUG"):
                 output_text_lines.append(line)
         output_text = "\n".join(output_text_lines)
-
-        tokens_per_sec = float(gen_line.split(',')[-2].split(' ')[1])
-        peak_memory_gb = float(mem_line.split(' ')[2])
 
         # parse acceptance rate from the full output
         acceptance_rate = None
@@ -68,16 +94,17 @@ def run_benchmark_command(command: list[str]) -> dict:
         if rate_match:
             acceptance_rate = float(rate_match.group(1))
 
-        return {
+        all_metrics = {
             "output": output_text,
-            "tokens_per_sec": tokens_per_sec,
-            "peak_memory_gb": peak_memory_gb,
             "acceptance_rate_percent": acceptance_rate,
-            "run_time_sec": time.time() - start_time
+            "run_time_sec": time.time() - start_time,
+            **prompt_metrics,
+            **gen_metrics,
+            **mem_metrics,
         }
+        return all_metrics
 
     except subprocess.CalledProcessError as e:
-        # stderr redirected, e.stdout will contain the full error log
         print(f"ERROR: Command failed with exit code {e.returncode}")
         print("--- COMBINED OUTPUT ---")
         print(e.stdout)
@@ -85,17 +112,13 @@ def run_benchmark_command(command: list[str]) -> dict:
     except subprocess.TimeoutExpired as e:
         print(f"ERROR: Command timed out after {e.timeout} seconds.")
         return {"error": "timeout"}
-
 def main():
-
-    # construct results file with datetime
-    results_file = f"cascade_benchmark_results_{datetime.datetime.now().strftime('%Y%m%d_%H%M%S')}.json"
 
     parser = argparse.ArgumentParser(description="Benchmark script for Speculative Cascades.")
     parser.add_argument(
         "--results-file",
         type=str,
-        default=results_file,
+        default=None,
         help="File to save the benchmark results."
     )
     parser.add_argument(
@@ -174,32 +197,39 @@ def main():
         results["speculative_cascade_opt"][f"alpha_{alpha}"] = run_benchmark_command(command)
 
     # Save results to a file
-    with open(args.results_file, 'w') as f:
-        json.dump(results, f, indent=4)
+    if args.results_file is None:
+            timestamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+            args.results_file = f"cascade_benchmark_results_{timestamp}.json"
 
     print(f"\n\nBenchmark complete. Results saved to {args.results_file}")
 
     # summary table
-    print("\n\n--- Benchmark Summary ---")
-    print(f"{'Configuration':<40} | {'Speed (tok/s)':<15} | {'Accept Rate (%)':<17} | {'Peak Memory (GB)':<18}")
-    print("-" * 95)
+    print("\n\n" + "="*120)
+    print("--- Benchmark Summary ---")
+    print("="*120)
+    header = f"{'Configuration':<35} | {'Gen Tok/s':<11} | {'Accept Rate (%)':<15} | {'Prompt Tok/s':<12} | {'Gen Tokens':<10} | {'Peak Mem (GB)':<15}"
+    print(header)
+    print("-" * 120)
 
     def print_summary_line(name, result):
         if "error" in result:
-            print(f"{name:<40} | {'ERROR':<15} | {'N/A':<17} | {'N/A':<18}")
+            print(f"{name:<35} | {'ERROR':<11} | {'N/A':<15} | {'N/A':<12} | {'N/A':<10} | {'N/A':<15}")
         else:
-            speed = f"{result['tokens_per_sec']:.2f}"
+            speed = f"{result['generation_tok_per_sec']:.2f}"
             rate = f"{result['acceptance_rate_percent']:.1f}" if result.get('acceptance_rate_percent') is not None else "N/A"
+            prompt_speed = f"{result['prompt_tok_per_sec']:.2f}"
+            gen_tokens = f"{result['generation_tokens']}"
             mem = f"{result['peak_memory_gb']:.2f}"
-            print(f"{name:<40} | {speed:<15} | {rate:<17} | {mem:<18}")
+            print(f"{name:<35} | {speed:<11} | {rate:<15} | {prompt_speed:<12} | {gen_tokens:<10} | {mem:<15}")
 
     print_summary_line("Verifier Only", results["verifier_only"])
     print_summary_line("Drafter Only", results["drafter_only"])
     print_summary_line("Standard Speculative Decoding", results["standard_speculative"])
     for alpha_str, result in results["speculative_cascade_opt"].items():
-        # alpha_str = "alpha_0.1"
         alpha_val = alpha_str.split('_')[1]
         print_summary_line(f"Cascade (opt, α={alpha_val})", result)
+
+    print("="*120)
 
 
 if __name__ == "__main__":
