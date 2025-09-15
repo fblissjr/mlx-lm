@@ -92,25 +92,6 @@ def can_trim_prompt_cache(cache: List[Any]) -> bool:
         return False
     return all(hasattr(c, "is_trimmable") and c.is_trimmable() for c in cache)
 
-# MODIFIED for speculative cascade:
-def trim_prompt_cache(cache: List[Any], num_tokens: int) -> int:
-    """
-    Trim the model's cache by the given number of tokens. This is done
-    in-place.
-
-    Args:
-        cache (List[Any]): The model's cache.
-        num_tokens (int): The number of tokens to trim from the end of the cache.
-
-    Returns:
-        int: The number of tokens that were actually trimmed.
-    """
-    if not can_trim_prompt_cache(cache) or len(cache) == 0:
-        return 0
-    # We assume all caches in the list are of the same type and have the same state,
-    # so we can just use the result of the first trim.
-    return [c.trim(num_tokens) for c in cache][0]
-
 # def can_trim_prompt_cache(cache: List[Any]) -> bool:
 #     """
 #     Check if model's cache can be trimmed.
@@ -118,23 +99,23 @@ def trim_prompt_cache(cache: List[Any], num_tokens: int) -> int:
 #     return all(c.is_trimmable() for c in cache)
 
 
-# def trim_prompt_cache(cache: List[Any], num_tokens: int) -> List[Any]:
-#     """
-#     Trim the model's cache by the given number of tokens.
+def trim_prompt_cache(cache: List[Any], num_tokens: int) -> List[Any]:
+    """
+    Trim the model's cache by the given number of tokens.
 
-#     This function will trim the cache if possible (in-place) and return the
-#     number of tokens that were trimmed.
+    This function will trim the cache if possible (in-place) and return the
+    number of tokens that were trimmed.
 
-#     Args:
-#         cache (List[Any]): The model's cache.
-#         num_tokens (int): The number of tokens to trim.
+    Args:
+        cache (List[Any]): The model's cache.
+        num_tokens (int): The number of tokens to trim.
 
-#     Returns:
-#         (int): The number of tokens that were trimmed.
-#     """
-#     if not can_trim_prompt_cache(cache) or len(cache) == 0:
-#         return 0
-#     return [c.trim(num_tokens) for c in cache][0]
+    Returns:
+        (int): The number of tokens that were trimmed.
+    """
+    if not can_trim_prompt_cache(cache) or len(cache) == 0:
+        return 0
+    return [c.trim(num_tokens) for c in cache][0]
 
 
 def create_attention_mask(

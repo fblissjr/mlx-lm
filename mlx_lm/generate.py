@@ -31,6 +31,7 @@ from .models.cache import (
 from .sample_utils import make_sampler
 from .tokenizer_utils import TokenizerWrapper
 from .utils import does_model_support_input_embeddings, load
+import copy
 
 DEFAULT_PROMPT = "hello"
 DEFAULT_MAX_TOKENS = 100
@@ -307,188 +308,6 @@ def maybe_quantize_kv_cache(prompt_cache, quantized_kv_start, kv_group_size, kv_
                     group_size=kv_group_size, bits=kv_bits
                 )
 
-## BEGIN SPECULATIVE CASCADE
-# ADDED: Helper function for cascade deferral logic
-def _compute_deferral_decision(
-    q_logits: mx.array, p_logits: mx.array, rule: str, alpha: float
-) -> bool:
-    """
-    Computes the deferral decision (delta) based on the cascade rule.
-
-    Args:
-        q_logits (mx.array): Logits from the drafter model `q`.
-        p_logits (mx.array): Logits from the verifier model `p`.
-        rule (str): The cascade rule to apply ("chow", "diff", or "opt").
-        alpha (float): The sensitivity parameter for the rule.
-
-    Returns:
-        bool: True if the decision is to defer to the verifier `p`, False otherwise.
-    """
-    # Use float32 for stable probability calculations
-    q_probs = mx.softmax(q_logits.astype(mx.float32))
-
-    if rule == "chow":
-        # Defer if the drafter's confidence is below a threshold.
-        defer = (mx.max(q_probs) < (1.0 - alpha)).item()
-
-    elif rule == "diff" or rule == "opt":
-        p_probs = mx.softmax(p_logits.astype(mx.float32))
-        max_q = mx.max(q_probs)
-        max_p = mx.max(p_probs)
-
-        if rule == "diff":
-            # Defer if the verifier's confidence is significantly higher.
-            defer = (max_q < (max_p - alpha)).item()
-        else:  # rule == "opt"
-            # Defer based on confidence difference, penalized by the
-            # Total Variation Distance between the distributions.
-            d_tv = mx.sum(mx.maximum(0, p_probs - q_probs))
-            defer = (max_q < (max_p - alpha * d_tv)).item()
-    else:
-        raise ValueError(f"Unknown cascade rule: {rule}")
-
-    return defer
-
-## Speculative Cascade Generation Step
-# ADDED: New generation function for Speculative Cascades
-def speculative_cascade_generate_step(
-    prompt: mx.array,
-    model: nn.Module,
-    draft_model: nn.Module,
-    cascade_rule: str,
-    cascade_alpha: float,
-    *,
-    num_draft_tokens=3,
-    max_tokens: int = 256,
-    sampler: Optional[Callable[[mx.array], mx.array]] = None,
-    logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None,
-    prompt_cache: Optional[Any] = None,
-) -> Generator[Tuple[int, mx.array, bool], None, None]:
-    """
-    A generator for speculative cascades, based on the paper
-    "Faster Cascades via Speculative Decoding".
-
-    Args:
-        prompt (mx.array): The input prompt.
-        model (nn.Module): The verifier model `p`.
-        draft_model (nn.Module): The drafter model `q`.
-        cascade_rule (str): The deferral rule to use ('chow', 'diff', 'opt').
-        cascade_alpha (float): The sensitivity parameter for the cascade rule.
-        num_draft_tokens (int, optional): The number of tokens to draft. Default: ``3``.
-        max_tokens (int): The maximum number of tokens to generate. Default: ``256``.
-        sampler (Callable, optional): A function to sample a token from logits.
-        logits_processors (List[Callable], optional): Functions to process logits.
-        prompt_cache (Any, optional): A pre-computed prompt cache.
-
-    Yields:
-        Tuple[int, mx.array, bool]: Token ID, log probabilities, and a bool indicating
-          if the token was from the draft model.
-    """
-    y = prompt.astype(mx.uint32)
-
-    if prompt_cache is None:
-        model_cache = cache.make_prompt_cache(model)
-        draft_cache = cache.make_prompt_cache(draft_model)
-    else:
-        model_cache = prompt_cache[: len(model.layers)]
-        draft_cache = prompt_cache[len(model.layers) :]
-
-    sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
-
-    # _step is a closure to simplify calls to the models with their respective caches
-    def _step(mdl, mdl_cache, tokens, n_predict=1):
-        with mx.stream(generation_stream):
-            logits = mdl(tokens[None], cache=mdl_cache)
-            logits = logits[:, -n_predict:, :]
-            if logits_processors:
-                # This is a simplified token history for processors.
-                # For full correctness, it should track the entire generated sequence.
-                current_tokens = prompt
-                for processor in logits_processors:
-                    logits = processor(current_tokens, logits)
-            return logits.squeeze(0)
-
-    # Prefill both models' caches with the initial prompt.
-    _step(draft_model, draft_cache, y, n_predict=y.size)
-    _step(model, model_cache, y, n_predict=y.size)
-
-    ntoks = 0
-    while ntoks < max_tokens:
-        # 1. Drafting Phase: Generate a block of candidate tokens and their logits from `q`.
-        draft_tokens = []
-        draft_logits_list = []
-        y_draft_sequence = y
-        for _ in range(num_draft_tokens):
-            logits_q = _step(draft_model, draft_cache, y_draft_sequence)
-            y_i = sampler(logits_q)
-            draft_tokens.append(y_i.item())
-            draft_logits_list.append(logits_q)
-            y_draft_sequence = mx.concatenate([y_draft_sequence, y_i])
-
-        # 2. Verification Phase: Get logits from `p` for all drafted positions in one pass.
-        all_p_logits = _step(model, model_cache, y_draft_sequence, n_predict=num_draft_tokens + 1)
-        mx.eval(all_p_logits) # Ensure logits are computed before the acceptance loop
-
-        # 3. Acceptance Loop: Iterate through drafts, probabilistically accepting or rejecting.
-        accepted_count = 0
-        for i in range(num_draft_tokens):
-            draft_token = draft_tokens[i]
-            q_logits = draft_logits_list[i]
-            p_logits = all_p_logits[i]
-
-            defer = _compute_deferral_decision(q_logits, p_logits, cascade_rule, cascade_alpha)
-            target_logits = p_logits if defer else q_logits
-
-            q_probs = mx.softmax(q_logits.astype(mx.float32))
-            target_probs = mx.softmax(target_logits.astype(mx.float32))
-
-            accept_prob = (target_probs[draft_token] / q_probs[draft_token]).item()
-
-            if mx.random.uniform() < accept_prob:
-                accepted_count += 1
-                y = mx.array([draft_token], dtype=mx.uint32)
-                yield y.item(), target_logits, True # Yield accepted token (from_draft=True)
-                if ntoks + accepted_count >= max_tokens:
-                    return
-            else:
-                # Rejection Sampling: Sample a new token from the residual distribution.
-                residual_probs = mx.maximum(0, target_probs - q_probs)
-                residual_probs /= mx.sum(residual_probs) # Normalize
-                new_token = mx.random.categorical(mx.log(residual_probs))
-
-                # Rewind caches to discard the rejected token and subsequent drafts.
-                num_to_trim = num_draft_tokens - i
-                trim_prompt_cache(model_cache, num_to_trim)
-                trim_prompt_cache(draft_cache, num_to_trim)
-
-                y = new_token
-                yield y.item(), target_logits, False # Yield resampled token (from_draft=False)
-                ntoks += accepted_count + 1
-                if ntoks >= max_tokens:
-                    return
-                break # End this generation turn
-        else: # This 'else' belongs to the for loop, executed if no break (all drafts accepted)
-            # Sample one more token to ensure forward progress
-            final_p_logits = all_p_logits[-1]
-
-            # We need q's logits for the final token to make a deferral decision
-            final_draft_token = mx.array([draft_tokens[-1]], dtype=mx.uint32)
-            y_for_final_q = mx.concatenate([prompt] + [mx.array(draft_tokens)])
-            final_q_logits = _step(draft_model, draft_cache, y_for_final_q)
-
-            defer = _compute_deferral_decision(final_q_logits, final_p_logits, cascade_rule, cascade_alpha)
-            target_logits = final_p_logits if defer else final_q_logits
-
-            y = sampler(target_logits)
-            yield y.item(), target_logits, False
-            ntoks += accepted_count + 1
-            if ntoks >= max_tokens:
-                return
-
-        # Update both caches with the newly accepted/sampled token for the next iteration.
-        _step(model, model_cache, y)
-        _step(draft_model, draft_cache, y)
-
 def generate_step(
     prompt: mx.array,
     model: nn.Module,
@@ -654,7 +473,32 @@ def generate_step(
         n += 1
 
 
-def speculative_generate_step(
+## BEGIN SPECULATIVE CASCADE
+# helper function for cascade deferral logic
+def _compute_deferral_decision(
+    q_logits: mx.array, p_logits: mx.array, rule: str, alpha: float
+) -> bool:
+    """
+    Computes the deferral decision (delta) based on the cascade rule from the paper.
+    """
+    q_probs = mx.softmax(q_logits.astype(mx.float32))
+
+    if rule == "chow":
+        defer = (mx.max(q_probs) < (1.0 - alpha)).item()
+    elif rule == "diff" or rule == "opt":
+        p_probs = mx.softmax(p_logits.astype(mx.float32))
+        max_q = mx.max(q_probs)
+        max_p = mx.max(p_probs)
+        if rule == "diff":
+            defer = (max_q < (max_p - alpha)).item()
+        else:  # rule == "opt"
+            d_tv = mx.sum(mx.maximum(0, p_probs - q_probs))
+            defer = (max_q < (max_p - alpha * d_tv)).item()
+    else:
+        raise ValueError(f"Unknown cascade rule: {rule}")
+    return defer
+
+def _original_speculative_generate_step(
     prompt: mx.array,
     model: nn.Module,
     draft_model: nn.Module,
@@ -828,16 +672,165 @@ def speculative_generate_step(
     finally:
         _rewind_cache(num_draft, n)
 
+## MODIFIED FOR SPECULATIVE CASCADE
+def speculative_generate_step(
+    prompt: mx.array,
+    model: nn.Module,
+    draft_model: nn.Module,
+    *,
+    num_draft_tokens=3,
+    max_tokens: int = 256,
+    sampler: Optional[Callable[[mx.array], mx.array]] = None,
+    logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None,
+    prompt_cache: Optional[Any] = None,
+    # cascade parameters
+    cascade_rule: Optional[str] = None,
+    cascade_alpha: float = 0.1,
+    **kwargs,
+) -> Generator[Tuple[int, mx.array, bool], None, None]:
 
-# MODIFIED: stream_generate to handle dispatching to the new cascade function
+    # standard spec decoding
+    if cascade_rule is None:
+        yield from _original_speculative_generate_step(
+            prompt, model, draft_model,
+            num_draft_tokens=num_draft_tokens,
+            max_tokens=max_tokens,
+            sampler=sampler,
+            logits_processors=logits_processors,
+            prompt_cache=prompt_cache,
+        )
+        return
+
+    y = prompt.astype(mx.uint32)
+
+    if prompt_cache is None:
+        model_cache = cache.make_prompt_cache(model)
+        draft_cache = cache.make_prompt_cache(draft_model)
+    else:
+        model_cache = prompt_cache[: len(model.layers)]
+        draft_cache = prompt_cache[len(model.layers) :]
+
+    sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
+
+    def _step(mdl, mdl_cache, tokens):
+        """Stateful step, updates cache in-place and returns last token logits."""
+        logits = mdl(tokens[None], cache=mdl_cache)
+        if logits_processors:
+            for processor in logits_processors:
+                logits = processor(tokens, logits)
+        return logits[:, -1, :]
+
+    # prefill
+    _step(model, model_cache, y)
+    _step(draft_model, draft_cache, y)
+
+    ntoks = 0
+    total_accepted = 0
+    total_drafted = 0
+
+    while ntoks < max_tokens:
+        # debug
+        if ntoks == 0:
+            print(f"\n[DEBUG] Using Speculative Cascade with rule: '{cascade_rule}', alpha: {cascade_alpha}\n", file=sys.stderr)
+
+        # drafting Phase
+        draft_tokens = []
+        draft_logits_list = []
+
+        temp_draft_cache = copy.deepcopy(draft_cache)
+        current_draft_y = y
+
+        for _ in range(num_draft_tokens):
+            logits_q = _step(draft_model, temp_draft_cache, current_draft_y)
+            y_i = sampler(logits_q).item()
+            draft_tokens.append(y_i)
+            draft_logits_list.append(logits_q.squeeze(0))
+            current_draft_y = mx.array([y_i], dtype=mx.uint32)
+
+        total_drafted += len(draft_tokens)
+
+        # iterative verification using a temporary model cache
+        temp_model_cache = copy.deepcopy(model_cache)
+        p_logits_list = []
+        current_verify_y = y
+        for i in range(num_draft_tokens):
+            logits_p = _step(model, temp_model_cache, current_verify_y)
+            p_logits_list.append(logits_p)
+            current_verify_y = mx.array([draft_tokens[i]], dtype=mx.uint32)
+        # get the final logit for the "one more token" case
+        final_p_logit_after_drafts = _step(model, temp_model_cache, current_verify_y)
+
+        # aAcceptance Loop
+        accepted_len = 0
+        finalized_tokens = []
+        from_draft_flags = []
+
+        for i in range(num_draft_tokens):
+            q_logits = draft_logits_list[i]
+            p_logits = p_logits_list[i].squeeze(0)
+            draft_token = draft_tokens[i]
+
+            defer = _compute_deferral_decision(q_logits, p_logits, cascade_rule, cascade_alpha)
+            target_logits = p_logits if defer else q_logits
+
+            q_probs = mx.softmax(q_logits.astype(mx.float32))
+            target_probs = mx.softmax(target_logits.astype(mx.float32))
+            accept_prob = (target_probs[draft_token] / q_probs[draft_token]).item() if q_probs[draft_token].item() > 1e-9 else 1.0
+
+            if mx.random.uniform() < accept_prob:
+                accepted_len += 1
+                finalized_tokens.append(draft_token)
+                from_draft_flags.append(True)
+            else:
+                residual_probs = mx.maximum(0, target_probs - q_probs)
+                residual_sum = mx.sum(residual_probs)
+                if residual_sum.item() < 1e-6:
+                    new_token = sampler(target_logits[None]).item()
+                else:
+                    new_token = mx.random.categorical(mx.log(residual_probs / residual_sum)[None]).item()
+                finalized_tokens.append(new_token)
+                from_draft_flags.append(False)
+                break
+
+        total_accepted += accepted_len
+
+        if accepted_len == num_draft_tokens:
+            p_logits = final_p_logit_after_drafts.squeeze(0)
+            q_logits = _step(draft_model, temp_draft_cache, current_verify_y).squeeze(0)
+            defer = _compute_deferral_decision(q_logits, p_logits, cascade_rule, cascade_alpha)
+            target_logits = p_logits if defer else q_logits
+            new_token = sampler(target_logits[None]).item()
+            finalized_tokens.append(new_token)
+            from_draft_flags.append(False)
+            print(f" [DEBUG: Turn Summary] Drafted {num_draft_tokens}, Accepted ALL, Final Sampled 1.", file=sys.stderr)
+        else:
+            print(f" [DEBUG: Turn Summary] Drafted {num_draft_tokens}, Accepted {accepted_len}, Resampled 1.", file=sys.stderr)
+
+        # state update
+        finalized_sequence_arr = mx.array(finalized_tokens, dtype=mx.uint32)
+
+        # advance main cache statefully with the finalized sequence
+        model(finalized_sequence_arr[None], cache=model_cache)
+        draft_model(finalized_sequence_arr[None], cache=draft_cache)
+
+        for i, token_item in enumerate(finalized_tokens):
+            yield token_item, None, from_draft_flags[i]
+            ntoks += 1
+            if ntoks >= max_tokens:
+                break
+
+        y = mx.array([finalized_tokens[-1]], dtype=mx.uint32)
+
+    if total_drafted > 0:
+        acceptance_rate = (total_accepted / total_drafted) * 100
+        print(f"\n[DEBUG: FINAL STATS] Total Drafted: {total_drafted}, Total Accepted: {total_accepted} ({acceptance_rate:.1f}% acceptance rate)", file=sys.stderr)
+
+# modified to dispatch
 def stream_generate(
     model: nn.Module,
     tokenizer: Union[PreTrainedTokenizer, TokenizerWrapper],
     prompt: Union[str, mx.array, List[int]],
     draft_model: Optional[nn.Module] = None,
-    # ADDED: New cascade parameters with default values
-    cascade_rule: Optional[str] = None,
-    cascade_alpha: float = 0.1,
     **kwargs,
 ) -> Generator[GenerationResponse, None, None]:
     if not isinstance(tokenizer, TokenizerWrapper):
@@ -853,35 +846,28 @@ def stream_generate(
 
     detokenizer = tokenizer.detokenizer
 
-    # MODIFIED: Dispatch logic for different generation methods
-    if cascade_rule is not None:
-        if draft_model is None:
-            raise ValueError("A draft_model must be provided to use speculative cascades.")
-        # Call the new speculative cascade generator
-        token_generator = speculative_cascade_generate_step(
-            prompt, model, draft_model, cascade_rule, cascade_alpha, **kwargs
-        )
-    elif draft_model is not None:
-        # Original speculative decoding path
-        kwargs.pop("max_kv_size", None)
-        kwargs.pop("prompt_progress_callback", None)
+    # dispatch logic start
+    if draft_model is None:
+        kwargs.pop("num_draft_tokens", None)
+        kwargs.pop("cascade_rule", None)
+        kwargs.pop("cascade_alpha", None)
+        token_generator = generate_step(prompt, model, **kwargs)
+        token_generator = ((token, logprobs, False) for token, logprobs in token_generator)
+    else:
+        # call speculative_generate_step wit kwargs to determine path
         token_generator = speculative_generate_step(
             prompt, model, draft_model, **kwargs
         )
-    else:
-        # Standard autoregressive path
-        kwargs.pop("num_draft_tokens", None)
-        token_generator = generate_step(prompt, model, **kwargs)
-        # Add a placeholder for from_draft
-        token_generator = (
-            (token, logprobs, False) for token, logprobs in token_generator
-        )
+    # dispatch logic end
+
     with wired_limit(model, [generation_stream]):
         tic = time.perf_counter()
+        prompt_tps = 0.0
         for n, (token, logprobs, from_draft) in enumerate(token_generator):
             if n == 0:
                 prompt_time = time.perf_counter() - tic
-                prompt_tps = prompt.size / prompt_time
+                if prompt_time > 0 and prompt.size > 0:
+                    prompt_tps = prompt.size / prompt_time
                 tic = time.perf_counter()
             if token in tokenizer.eos_token_ids:
                 break
@@ -896,50 +882,48 @@ def stream_generate(
                 prompt_tokens=prompt.size,
                 prompt_tps=prompt_tps,
                 generation_tokens=n + 1,
-                generation_tps=(n + 1) / (time.perf_counter() - tic),
+                generation_tps=(n + 1) / (time.perf_counter() - tic) if tic < time.perf_counter() else 0.0,
                 peak_memory=mx.get_peak_memory() / 1e9,
                 finish_reason=None,
             )
 
         detokenizer.finalize()
+        gen_time = time.perf_counter() - tic
+
+        final_token = token if 'token' in locals() else -1
+        final_logprobs = logprobs if 'logprobs' in locals() else None
+        final_from_draft = from_draft if 'from_draft' in locals() else False
+        num_generated = n + 1 if 'n' in locals() else 0
+
         yield GenerationResponse(
             text=detokenizer.last_segment,
-            token=token,
-            logprobs=logprobs,
-            from_draft=from_draft,
+            token=final_token,
+            logprobs=final_logprobs,
+            from_draft=final_from_draft,
             prompt_tokens=prompt.size,
             prompt_tps=prompt_tps,
-            generation_tokens=n + 1,
-            generation_tps=(n + 1) / (time.perf_counter() - tic),
+            generation_tokens=num_generated,
+            generation_tps=num_generated / gen_time if gen_time > 0 else 0.0,
             peak_memory=mx.get_peak_memory() / 1e9,
-            finish_reason="stop" if token in tokenizer.eos_token_ids else "length",
+            finish_reason="stop" if 'token' in locals() and token in tokenizer.eos_token_ids else "length",
         )
+## End Speculative cascade stuff
 
-
-# MODIFIED: generate() to accept and pass on speculative cascade arguments
 def generate(
     model: nn.Module,
     tokenizer: Union[PreTrainedTokenizer, TokenizerWrapper],
     prompt: Union[str, List[int]],
     verbose: bool = False,
-    # ADDED: Cascade parameters to pass down
-    cascade_rule: Optional[str] = None,
-    cascade_alpha: float = 0.1,
     **kwargs,
 ) -> str:
+    """
+    Generate a complete response from the model.
+    """
     if verbose:
         print("=" * 10)
 
     text = ""
-    # Pass new args to stream_generate
-    for response in stream_generate(
-        model,
-        tokenizer,
-        prompt,
-        cascade_rule=cascade_rule,
-        cascade_alpha=cascade_alpha,
-        **kwargs
-    ):
+    for response in stream_generate(model, tokenizer, prompt, **kwargs):
         if verbose:
             print(response.text, end="", flush=True)
         text += response.text
@@ -949,7 +933,7 @@ def generate(
         print("=" * 10)
         if len(text) == 0:
             print("No text generated for this prompt")
-            return "" # Return empty string instead of None
+            return ""
         print(
             f"Prompt: {response.prompt_tokens} tokens, "
             f"{response.prompt_tps:.3f} tokens-per-sec"
@@ -960,6 +944,7 @@ def generate(
         )
         print(f"Peak memory: {response.peak_memory:.3f} GB")
     return text
+
 
 
 def main():
@@ -1091,7 +1076,7 @@ def main():
         quantized_kv_start=args.quantized_kv_start,
         draft_model=draft_model,
         num_draft_tokens=args.num_draft_tokens,
-        # ADDED: Pass speculative cascade parameters
+        # pass speculative cascade parameters
         cascade_rule=args.cascade_rule,
         cascade_alpha=args.cascade_alpha,
     )
