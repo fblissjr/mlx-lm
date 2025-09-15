@@ -1,10 +1,9 @@
-# Copyright © 2024 Apple Inc.
-
 import argparse
 import math
 import os
 import re
 import types
+import warnings
 from pathlib import Path
 
 import mlx.core as mx
@@ -13,6 +12,7 @@ import mlx.optimizers as optim
 import numpy as np
 import yaml
 
+from .tuner.callbacks import get_reporting_callbacks
 from .tuner.datasets import CacheDataset, load_dataset
 from .tuner.trainer import TrainingArgs, TrainingCallback, evaluate, train
 from .tuner.utils import (
@@ -47,6 +47,9 @@ CONFIG_DEFAULTS = {
     "optimizer_config": {
         "adam": {},
         "adamw": {},
+        "muon": {},
+        "sgd": {},
+        "adafactor": {},
     },
     "data": "data/",
     "seed": 0,
@@ -66,8 +69,11 @@ CONFIG_DEFAULTS = {
     "config": None,
     "grad_checkpoint": False,
     "lr_schedule": None,
-    "lora_parameters": {"rank": 8, "dropout": 0.0, "scale": 10.0},
+    "lora_parameters": {"rank": 8, "dropout": 0.0, "scale": 20.0},
     "mask_prompt": False,
+    "wandb": None,  # will be deprecated in a future release
+    "report_to": None,
+    "project_name": None,
 }
 
 
@@ -103,9 +109,9 @@ def build_parser():
     parser.add_argument(
         "--optimizer",
         type=str,
-        choices=["adam", "adamw"],
+        choices=["adam", "adamw", "muon", "sgd", "adafactor"],
         default=None,
-        help="Optimizer to use for training: adam or adamw",
+        help="Optimizer to use for training: adam, adamw, sgd, or adafactor.",
     )
     parser.add_argument(
         "--mask-prompt",
@@ -179,6 +185,27 @@ def build_parser():
         help="Use gradient checkpointing to reduce memory use.",
         default=None,
     )
+    parser.add_argument(  # will be deprecated in a future release
+        "--wandb",
+        type=str,
+        default=None,
+        help=(
+            "The 'wandb' argument is deprecated and will be removed in a future release. "
+            "Use 'report_to: wandb' and 'project_name' in the configuration instead."
+        ),
+    )
+    parser.add_argument(
+        "--report-to",
+        type=str,
+        default=None,
+        help="Services to report logs to ('wandb', 'swanlab', or 'wandb,swanlab').",
+    )
+    parser.add_argument(
+        "--project-name",
+        type=str,
+        default=None,
+        help="Project name for logging. Defaults to the name of the root directory.",
+    )
     parser.add_argument("--seed", type=int, help="The PRNG seed")
     return parser
 
@@ -201,6 +228,8 @@ def train_model(
     if args.fine_tune_type == "full":
         for l in model.layers[-max(args.num_layers, 0) :]:
             l.unfreeze()
+
+        args.lora_parameters = None
     elif args.fine_tune_type in ["lora", "dora"]:
         # Convert linear layers to lora/dora layers and unfreeze in the process
         linear_to_lora_layers(
@@ -243,11 +272,16 @@ def train_model(
 
     optimizer_name = args.optimizer.lower()
     optimizer_config = args.optimizer_config.get(optimizer_name, {})
-
     if optimizer_name == "adam":
         opt_class = optim.Adam
     elif optimizer_name == "adamw":
         opt_class = optim.AdamW
+    elif optimizer_name == "muon":
+        opt_class = optim.Muon
+    elif optimizer_name == "sgd":
+        opt_class = optim.SGD
+    elif optimizer_name == "adafactor":
+        opt_class = optim.Adafactor
     else:
         raise ValueError(f"Unsupported optimizer: {optimizer_name}")
 
@@ -280,9 +314,23 @@ def evaluate_model(args, model: nn.Module, test_set):
 
 def run(args, training_callback: TrainingCallback = None):
     np.random.seed(args.seed)
+    if args.wandb is not None:
+        warnings.warn(
+            "The 'wandb' argument is deprecated and will be removed in a future release. "
+            "Use 'report_to: wandb' and 'project_name' in the configuration instead.",
+            DeprecationWarning,
+        )
+        args.report_to = "wandb"
+        args.project_name = args.wandb
+    training_callback = get_reporting_callbacks(
+        args.report_to,
+        project_name=args.project_name,
+        log_dir=args.adapter_path,
+        config=vars(args),
+    )
 
     print("Loading pretrained model")
-    model, tokenizer = load(args.model)
+    model, tokenizer = load(args.model, tokenizer_config={"trust_remote_code": True})
 
     print("Loading datasets")
     train_set, valid_set, test_set = load_dataset(args, tokenizer)

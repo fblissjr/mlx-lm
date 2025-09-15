@@ -54,6 +54,13 @@ def linear_to_lora_layers(
     """
 
     def to_lora(layer):
+        if not use_dora and hasattr(layer, "to_lora"):
+            return layer.to_lora(
+                r=config["rank"],
+                scale=config["scale"],
+                dropout=config["dropout"],
+            )
+
         if isinstance(layer, (nn.Linear, nn.QuantizedLinear)):
             LoRALayer = DoRALinear if use_dora else LoRALinear
         elif isinstance(layer, (SwitchLinear, QuantizedSwitchLinear)):
@@ -77,9 +84,11 @@ def linear_to_lora_layers(
     keys = config.get("keys", None)
     if keys is not None:
         keys = set(keys)
-    elif model.model_type in [
+    elif model.model_type in {
         "mistral",
+        "mistral3",
         "llama",
+        "lfm2",
         "phi",
         "mixtral",
         "nemotron",
@@ -101,61 +110,103 @@ def linear_to_lora_layers(
         "cohere2",
         "minicpm",
         "minicpm3",
+        "minicpm4",
         "deepseek",
         "olmo2",
         "olmoe",
         "internlm3",
         "glm4",
+        "glm",
         "mimo",
-    ]:
-        keys = set(["self_attn.q_proj", "self_attn.v_proj"])
+        "ernie4_5",
+        "dots1",
+        "smollm3",
+        "exaone4",
+        "hunyuan_v1_dense",
+        "gpt_oss",
+        "ernie4_5_moe",
+        "granitemoe",
+        "longcat_flash",
+        "seed_oss",
+        "apertus",
+        "qwen3_next",
+        "Klear",
+        "lille-130m",
+    }:
+        keys = {"self_attn.q_proj", "self_attn.v_proj"}
         if model.model_type in ["mixtral", "phimoe"]:
             keys.add("block_sparse_moe.gate")
-        if model.model_type == "qwen2_moe":
+        if model.model_type in ["qwen2_moe", "qwen3_next"]:
             keys.add("mlp.gate")
             keys.add("mlp.shared_expert_gate")
-        if model.model_type in ["olmoe", "qwen3_moe"]:
+        if model.model_type in ["olmoe", "qwen3_moe", "dots1", "Klear"]:
             keys.add("mlp.gate")
-
+        if model.model_type in ["longcat_flash"]:
+            keys.add("mlp.router.classifier")
+        if model.model_type == "lille-130m":
+            keys.add("attention.qkv_proj")
+            keys.add("attention.out_proj")
+            keys.add("feed_forward.gate_proj")
+            keys.add("feed_forward.up_proj")
+            keys.add("feed_forward.down_proj")
+        elif model.model_type == "qwen3_next":
+            keys.add("linear_attn.in_proj_qkvz")
+            keys.add("linear_attn.out_proj")
+            keys.add("linear_attn.in_proj_ba")
+            keys.add("linear_attn.dt_bias")
+            keys.add("self_attn.q_proj")
+            keys.add("self_attn.k_proj")
+            keys.add("self_attn.v_proj")
+            keys.add("self_attn.o_proj")
     elif model.model_type == "gpt_bigcode":
-        keys = set(["attn.c_attn"])
+        keys = {"attn.c_attn"}
     elif model.model_type == "gpt2":
-        keys = set(["attn.c_attn"])
+        keys = {"attn.c_attn"}
     elif model.model_type == "gpt_neox":
-        keys = set(["attention.query_key_value"])
+        keys = {"attention.query_key_value"}
     elif model.model_type == "olmo":
-        keys = set(["att_proj"])
+        keys = {"att_proj"}
     elif model.model_type == "openelm":
-        keys = set(["attn.qkv_proj"])
+        keys = {"attn.qkv_proj"}
     elif model.model_type == "phi3":
-        keys = set(["self_attn.qkv_proj"])
+        keys = {"self_attn.qkv_proj"}
     elif model.model_type == "phi-msft":
-        keys = set(["mixer.Wqkv", "moe.gate"])
+        keys = {"mixer.Wqkv", "moe.gate"}
     elif model.model_type == "dbrx":
-        keys = set(["norm_attn_norm.attn.Wqkv", "ffn.router.layer"])
+        keys = {"norm_attn_norm.attn.Wqkv", "ffn.router.layer"}
     elif model.model_type == "internlm2":
-        keys = set(["attention.wqkv", "attention.wo"])
-    elif model.model_type == "deepseek_v2" or model.model_type == "minicpm3":
-        keys = set(
-            [
-                "self_attn.q_proj",
-                "self_attn.q_a_proj",
-                "self_attn.q_b_proj",
-                "self_attn.kv_a_proj_with_mqa",
-                "self_attn.kv_b_proj",
-            ]
-        )
+        keys = {"attention.wqkv", "attention.wo"}
+    elif model.model_type in {
+        "deepseek_v2",
+        "deepseek_v3",
+        "longcat_flash",
+        "minicpm3",
+    }:
+        keys = {
+            "self_attn.q_proj",
+            "self_attn.q_a_proj",
+            "self_attn.q_b_proj",
+            "self_attn.kv_a_proj_with_mqa",
+            "self_attn.kv_b_proj",
+        }
     elif model.model_type == "mamba":
-        keys = set(
-            [
-                "mixer.in_proj",
-                "mixer.x_proj",
-                "mixer.dt_proj",
-                "mixer.out_proj",
-            ]
-        )
+        keys = {
+            "mixer.in_proj",
+            "mixer.x_proj",
+            "mixer.dt_proj",
+            "mixer.out_proj",
+        }
     elif model.model_type == "exaone":
-        keys = set(["attn.attention.q_proj", "attn.attention.v_proj"])
+        keys = {"attn.attention.q_proj", "attn.attention.v_proj"}
+    elif model.model_type == "bailing_moe":
+        keys = {"attention.query_key_value", "attention.dense"}
+    elif model.model_type == "nemotron_h":
+        keys.add("mixer.in_proj")
+        keys.add("mixer.out_proj")
+        keys.add("mixer.q_proj")
+        keys.add("mixer.k_proj")
+        keys.add("mixer.v_proj")
+        keys.add("mixer.o_proj")
     else:
         raise ValueError(f"Lora does not support {model.model_type}")
 
@@ -207,39 +258,36 @@ def dequantize(model: nn.Module) -> nn.Module:
     Returns:
         nn.Module: The model with dequantized layers.
     """
-    de_quantize_layers = []
+    dequantize_layers = []
     for name, module in model.named_modules():
+        bias = "bias" in module
         if isinstance(module, nn.QuantizedLinear):
-            bias = "bias" in module
-            weight = module.weight
-            weight = mx.dequantize(
-                weight,
-                module.scales,
-                module.biases,
-                module.group_size,
-                module.bits,
-            ).astype(mx.float16)
-            output_dims, input_dims = weight.shape
-            linear = nn.Linear(input_dims, output_dims, bias=bias)
-            linear.weight = weight
-            if bias:
-                linear.bias = module.bias
-            de_quantize_layers.append((name, linear))
-        if isinstance(module, nn.QuantizedEmbedding):
-            weight = mx.dequantize(
-                module.weight,
-                module.scales,
-                module.biases,
-                module.group_size,
-                module.bits,
-            ).astype(mx.float16)
-            num_embeddings, dims = weight.shape
-            emb = nn.Embedding(num_embeddings, dims)
-            emb.weight = weight
-            de_quantize_layers.append((name, emb))
+            cls = nn.Linear
+            kwargs = {"bias": bias}
+        elif isinstance(module, nn.QuantizedEmbedding):
+            kwargs = {}
+            cls = nn.Embedding
+        elif isinstance(module, QuantizedSwitchLinear):
+            kwargs = {"bias": bias}
+            cls = SwitchLinear
+        else:
+            continue
+        weight = mx.dequantize(
+            module.weight,
+            module.scales,
+            module.biases,
+            module.group_size,
+            module.bits,
+        )
+        args = weight.shape[::-1]
+        m = cls(*args, **kwargs)
+        if bias:
+            m.bias = module.bias
+        m.weight = weight
+        dequantize_layers.append((name, m))
 
-    if len(de_quantize_layers) > 0:
-        model.update_modules(tree_unflatten(de_quantize_layers))
+    if len(dequantize_layers) > 0:
+        model.update_modules(tree_unflatten(dequantize_layers))
     return model
 
 
@@ -262,20 +310,24 @@ def remove_lora_layers(model: nn.Module) -> nn.Module:
     return model
 
 
-def nparams(module):
-    if hasattr(module, "bits"):
-        n = 0 if not hasattr(module, "bias") else module.bias.size
-        return n + module.weight.size * 32 // module.bits
-    return sum(v.size for _, v in tree_flatten(module.parameters()))
-
-
-def print_trainable_parameters(model):
+def get_total_parameters(model):
     leaf_modules = tree_flatten(
         model.leaf_modules(), is_leaf=lambda m: isinstance(m, nn.Module)
     )
-    total_p = sum(nparams(m) for _, m in leaf_modules) / 10**6
+
+    def nparams(m):
+        if hasattr(m, "bits"):
+            n = 0 if not hasattr(m, "bias") else m.bias.size
+            return n + m.weight.size * 32 // m.bits
+        return sum(v.size for _, v in tree_flatten(m.parameters()))
+
+    return sum(nparams(m) for _, m in leaf_modules)
+
+
+def print_trainable_parameters(model):
+    total_p = get_total_parameters(model) / 1e6
     trainable_p = (
-        sum(v.size for _, v in tree_flatten(model.trainable_parameters())) / 10**6
+        sum(v.size for _, v in tree_flatten(model.trainable_parameters())) / 1e6
     )
     print(
         f"Trainable parameters: {(trainable_p * 100 / total_p):.3f}% "

@@ -7,7 +7,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
-from .su_rope import SuScaledRotaryEmbedding
+from .rope_utils import SuScaledRoPE
 
 
 @dataclass
@@ -63,7 +63,7 @@ class Attention(nn.Module):
 
         rope_dim = int(head_dim * args.partial_rotary_factor)
         if args.rope_scaling and args.rope_scaling["type"] in ["longrope", "su"]:
-            self.rope = SuScaledRotaryEmbedding(
+            self.rope = SuScaledRoPE(
                 rope_dim,
                 base=args.rope_theta,
                 max_position_embeddings=args.max_position_embeddings,
@@ -171,16 +171,14 @@ class Phi3Model(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
-        mask: mx.array = None,
         cache=None,
     ):
         h = self.embed_tokens(inputs)
 
-        if mask is None:
-            mask = create_attention_mask(h, cache)
-
         if cache is None:
             cache = [None] * len(self.layers)
+
+        mask = create_attention_mask(h, cache[0])
 
         for layer, c in zip(self.layers, cache):
             h = layer(h, mask, c)
@@ -200,10 +198,9 @@ class Model(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
-        mask: mx.array = None,
         cache=None,
     ):
-        out = self.model(inputs, mask, cache)
+        out = self.model(inputs, cache)
         if self.args.tie_word_embeddings:
             out = self.model.embed_tokens.as_linear(out)
         else:

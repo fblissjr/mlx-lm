@@ -141,6 +141,8 @@ def process_message_content(messages):
             if len(text_fragments) != len(content):
                 raise ValueError("Only 'text' content type is supported.")
             message["content"] = "".join(text_fragments)
+        elif content is None:
+            message["content"] = ""
 
 
 @dataclass
@@ -160,18 +162,14 @@ class ModelProvider:
         self.draft_model = None
 
         # Preload the default model if it is provided
+        self.default_model_map = {}
         if self.cli_args.model is not None:
-            self.load("default_model", draft_model_path="default_model")
-
-    def _validate_model_path(self, model_path: str):
-        model_path = Path(model_path)
-        if model_path.exists() and not model_path.is_relative_to(Path.cwd()):
-            raise RuntimeError(
-                "Local models must be relative to the current working dir."
-            )
+            self.default_model_map[self.cli_args.model] = "default_model"
+            self.load(self.cli_args.model, draft_model_path="default_model")
 
     # Added in adapter_path to load dynamically
     def load(self, model_path, adapter_path=None, draft_model_path=None):
+        model_path = self.default_model_map.get(model_path, model_path)
         if self.model_key == (model_path, adapter_path, draft_model_path):
             return self.model, self.tokenizer
 
@@ -194,15 +192,13 @@ class ModelProvider:
                     "A model path has to be given as a CLI "
                     "argument or in the HTTP request"
                 )
+            adapter_path = adapter_path or self.cli_args.adapter_path
             model, tokenizer = load(
                 self.cli_args.model,
-                adapter_path=(
-                    adapter_path if adapter_path else self.cli_args.adapter_path
-                ),  # if the user doesn't change the model but adds an adapter path
+                adapter_path=adapter_path,
                 tokenizer_config=tokenizer_config,
             )
         else:
-            self._validate_model_path(model_path)
             model, tokenizer = load(
                 model_path, adapter_path=adapter_path, tokenizer_config=tokenizer_config
             )
@@ -295,7 +291,23 @@ class APIHandler(BaseHTTPRequestHandler):
         # Fetch and parse request body
         content_length = int(self.headers["Content-Length"])
         raw_body = self.rfile.read(content_length)
-        self.body = json.loads(raw_body.decode())
+        try:
+            self.body = json.loads(raw_body.decode())
+        except json.JSONDecodeError as e:
+            logging.error(f"JSONDecodeError: {e} - Raw body: {raw_body.decode()}")
+            # Set appropriate headers based on streaming requirement
+            if self.stream:
+                self._set_stream_headers(400)
+                self.wfile.write(
+                    f"data: {json.dumps({'error': f'Invalid JSON in request body: {e}'})}\n\n".encode()
+                )
+            else:
+                self._set_completion_headers(400)
+                self.wfile.write(
+                    json.dumps({"error": f"Invalid JSON in request body: {e}"}).encode()
+                )
+            return
+
         indent = "\t"  # Backslashes can't be inside of f-strings
         logging.debug(f"Incoming Request Body: {json.dumps(self.body, indent=indent)}")
         assert isinstance(
@@ -307,20 +319,31 @@ class APIHandler(BaseHTTPRequestHandler):
         self.stream_options = self.body.get("stream_options", None)
         self.requested_model = self.body.get("model", "default_model")
         self.requested_draft_model = self.body.get("draft_model", "default_model")
-        self.num_draft_tokens = self.body.get("num_draft_tokens", 3)
+        self.num_draft_tokens = self.body.get(
+            "num_draft_tokens", self.model_provider.cli_args.num_draft_tokens
+        )
         self.adapter = self.body.get("adapters", None)
         self.max_tokens = self.body.get("max_completion_tokens", None)
         if self.max_tokens is None:
-            self.max_tokens = self.body.get("max_tokens", 512)
-        self.temperature = self.body.get("temperature", 0.0)
-        self.top_p = self.body.get("top_p", 1.0)
+            self.max_tokens = self.body.get(
+                "max_tokens", self.model_provider.cli_args.max_tokens
+            )
+        self.temperature = self.body.get(
+            "temperature", self.model_provider.cli_args.temp
+        )
+        self.top_p = self.body.get("top_p", self.model_provider.cli_args.top_p)
+        self.top_k = self.body.get("top_k", self.model_provider.cli_args.top_k)
+        self.min_p = self.body.get("min_p", self.model_provider.cli_args.min_p)
         self.repetition_penalty = self.body.get("repetition_penalty", 1.0)
         self.repetition_context_size = self.body.get("repetition_context_size", 20)
         self.xtc_probability = self.body.get("xtc_probability", 0.0)
         self.xtc_threshold = self.body.get("xtc_threshold", 0.0)
         self.logit_bias = self.body.get("logit_bias", None)
         self.logprobs = self.body.get("logprobs", -1)
+        self.seed = self.body.get("seed", None)
         self.validate_model_parameters()
+        if self.seed is not None:
+            mx.random.seed(self.seed)
         # Load the model if needed
         try:
             self.model, self.tokenizer = self.model_provider.load(
@@ -328,10 +351,10 @@ class APIHandler(BaseHTTPRequestHandler):
                 self.adapter,
                 self.requested_draft_model,
             )
-        except:
+        except Exception as e:
             self._set_completion_headers(404)
             self.end_headers()
-            self.wfile.write(b"Not Found")
+            self.wfile.write((f"{e}").encode())
             return
 
         # Get stop id sequences, if provided
@@ -369,6 +392,15 @@ class APIHandler(BaseHTTPRequestHandler):
 
         if not isinstance(self.top_p, (float, int)) or self.top_p < 0 or self.top_p > 1:
             raise ValueError("top_p must be a float between 0 and 1")
+
+        if not isinstance(self.top_k, int) or self.top_k < 0:
+            raise ValueError("top_k must be a non-negative integer")
+
+        if not isinstance(self.min_p, (float, int)) or self.min_p < 0 or self.min_p > 1:
+            raise ValueError("min_p must be a float between 0 and 1")
+
+        if not isinstance(self.num_draft_tokens, int) or self.num_draft_tokens < 0:
+            raise ValueError("num_draft_tokens must be a non-negative integer")
 
         if (
             not isinstance(self.repetition_penalty, (float, int))
@@ -408,6 +440,8 @@ class APIHandler(BaseHTTPRequestHandler):
             raise ValueError("model must be a string")
         if self.adapter is not None and not isinstance(self.adapter, str):
             raise ValueError("adapter must be a string")
+        if self.seed is not None and not isinstance(self.seed, int):
+            raise ValueError("seed must be an integer")
 
     def generate_response(
         self,
@@ -418,6 +452,7 @@ class APIHandler(BaseHTTPRequestHandler):
         token_logprobs: Optional[List[float]] = None,
         top_tokens: Optional[List[Dict[int, float]]] = None,
         tokens: Optional[List[int]] = None,
+        tool_calls: Optional[List[str]] = None,
     ) -> dict:
         """
         Generate a single response packet based on response type (stream or
@@ -436,13 +471,26 @@ class APIHandler(BaseHTTPRequestHandler):
             top_tokens (Optional[List[Dict[int, float]]]): List of dictionaries mapping
               tokens to logprobs for the top N tokens at each token position.
             tokens (Optional[List[int]]): List of tokens to return with logprobs structure
+            tool_calls (Optional[List[str]]): List of tool calls.
 
         Returns:
             dict: A dictionary containing the response, in the same format as
               OpenAI's API.
         """
-        token_logprobs = token_logprobs if token_logprobs else []
-        top_logprobs = top_tokens if top_tokens else []
+        token_logprobs = token_logprobs or []
+        top_logprobs = top_tokens or []
+        tool_calls = tool_calls or []
+
+        def parse_function(tool_text):
+            tool_call = json.loads(tool_text.strip())
+            return {
+                "function": {
+                    "name": tool_call.get("name", None),
+                    "arguments": json.dumps(tool_call.get("arguments", "")),
+                },
+                "type": "function",
+                "id": None,
+            }
 
         # Static response
         response = {
@@ -454,15 +502,17 @@ class APIHandler(BaseHTTPRequestHandler):
             "choices": [
                 {
                     "index": 0,
-                    "logprobs": {
-                        "token_logprobs": token_logprobs,
-                        "top_logprobs": top_logprobs,
-                        "tokens": tokens,
-                    },
                     "finish_reason": finish_reason,
-                }
+                },
             ],
         }
+
+        if token_logprobs or top_logprobs or tokens:
+            response["choices"][0]["logprobs"] = {
+                "token_logprobs": token_logprobs,
+                "top_logprobs": top_logprobs,
+                "tokens": tokens,
+            }
 
         if not self.stream:
             if not (
@@ -484,11 +534,15 @@ class APIHandler(BaseHTTPRequestHandler):
         # Add dynamic response
         if self.object_type.startswith("chat.completion"):
             key_name = "delta" if self.stream else "message"
-            choice[key_name] = {"role": "assistant", "content": text}
+            choice[key_name] = {
+                "role": "assistant",
+                "content": text,
+                "tool_calls": [parse_function(tool_text) for tool_text in tool_calls],
+            }
         elif self.object_type == "text_completion":
             choice.update(text=text)
         else:
-            ValueError(f"Unsupported response type: {self.object_type}")
+            raise ValueError(f"Unsupported response type: {self.object_type}")
 
         return response
 
@@ -529,6 +583,9 @@ class APIHandler(BaseHTTPRequestHandler):
         cache_len = len(self.prompt_cache.tokens)
         prompt_len = len(prompt)
         com_prefix_len = common_prefix_len(self.prompt_cache.tokens, prompt)
+
+        # Leave at least one token in the prompt
+        com_prefix_len = min(com_prefix_len, len(prompt) - 1)
 
         # Condition 1: Model changed or no common prefix at all. Reset cache.
         if (
@@ -603,6 +660,8 @@ class APIHandler(BaseHTTPRequestHandler):
         sampler = make_sampler(
             self.temperature,
             top_p=self.top_p,
+            top_k=self.top_k,
+            min_p=self.min_p,
             xtc_probability=self.xtc_probability,
             xtc_threshold=self.xtc_threshold,
             xtc_special_tokens=[
@@ -616,6 +675,27 @@ class APIHandler(BaseHTTPRequestHandler):
             self.repetition_context_size,
         )
 
+        tool_calls = []
+        tool_text = ""
+        in_tool_call = False
+        segment = ""
+
+        # Create keepalive callback to send SSE comments during long prompt processing
+        def keepalive_callback(processed_tokens, total_tokens):
+            logging.info(
+                f"Prompt processing progress: {processed_tokens}/{total_tokens}"
+            )
+            if self.stream:
+                try:
+                    # Send SSE comment for keepalive - invisible to clients but keeps connection alive
+                    self.wfile.write(
+                        f": keepalive {processed_tokens}/{total_tokens}\n\n".encode()
+                    )
+                    self.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    # Client disconnected, ignore
+                    pass
+
         for gen_response in stream_generate(
             model=self.model,
             tokenizer=self.tokenizer,
@@ -626,13 +706,29 @@ class APIHandler(BaseHTTPRequestHandler):
             prompt_cache=self.prompt_cache.cache,
             draft_model=self.model_provider.draft_model,
             num_draft_tokens=self.num_draft_tokens,
+            prompt_progress_callback=keepalive_callback,
         ):
-            segment = gen_response.text
-            text += segment
-            logging.debug(text)
+            logging.debug(gen_response.text)
+
+            if (
+                self.tokenizer.has_tool_calling
+                and gen_response.text == self.tokenizer.tool_call_start
+            ):
+                in_tool_call = True
+            elif in_tool_call:
+                if gen_response.text == self.tokenizer.tool_call_end:
+                    tool_calls.append(tool_text)
+                    tool_text = ""
+                    in_tool_call = False
+                else:
+                    tool_text += gen_response.text
+            else:
+                text += gen_response.text
+                segment += gen_response.text
             token = gen_response.token
             logprobs = gen_response.logprobs
             tokens.append(token)
+            self.prompt_cache.tokens.append(token)
 
             if self.logprobs > 0:
                 sorted_indices = mx.argpartition(-logprobs, kth=self.logprobs - 1)
@@ -653,9 +749,10 @@ class APIHandler(BaseHTTPRequestHandler):
                         tokens[-stop_condition.trim_length :]
                     )
                     text = text[: -len(stop_sequence_suffix)]
+                segment = ""
                 break
 
-            if self.stream:
+            if self.stream and not in_tool_call:
                 # If the end of tokens overlaps with a stop sequence, generate new
                 # tokens until we know if the stop sequence is hit or not
                 if any(
@@ -665,23 +762,35 @@ class APIHandler(BaseHTTPRequestHandler):
                     )
                 ):
                     continue
-                elif segment:
-                    response = self.generate_response(segment, None)
+                elif segment or tool_calls:
+                    response = self.generate_response(
+                        segment, None, tool_calls=tool_calls
+                    )
                     self.wfile.write(f"data: {json.dumps(response)}\n\n".encode())
                     self.wfile.flush()
+                    segment = ""
+                    tool_calls = []
 
-        self.prompt_cache.tokens.extend(tokens)
+        if gen_response.finish_reason is not None:
+            finish_reason = gen_response.finish_reason
 
         logging.debug(f"Prompt: {gen_response.prompt_tps:.3f} tokens-per-sec")
         logging.debug(f"Generation: {gen_response.generation_tps:.3f} tokens-per-sec")
         logging.debug(f"Peak memory: {gen_response.peak_memory:.3f} GB")
 
         if self.stream:
-            response = self.generate_response(segment, finish_reason)
+            response = self.generate_response(
+                segment, finish_reason, tool_calls=tool_calls
+            )
             self.wfile.write(f"data: {json.dumps(response)}\n\n".encode())
             self.wfile.flush()
             if self.stream_options is not None and self.stream_options["include_usage"]:
-                response = self.completion_usage_response(len(prompt), len(tokens))
+                original_prompt_length = (
+                    len(self.prompt_cache.tokens) - len(tokens) + len(prompt)
+                )
+                response = self.completion_usage_response(
+                    original_prompt_length, len(tokens)
+                )
                 self.wfile.write(f"data: {json.dumps(response)}\n\n".encode())
                 self.wfile.flush()
             self.wfile.write("data: [DONE]\n\n".encode())
@@ -695,6 +804,7 @@ class APIHandler(BaseHTTPRequestHandler):
                 token_logprobs=token_logprobs,
                 top_tokens=top_tokens,
                 tokens=tokens,
+                tool_calls=tool_calls,
             )
             response_json = json.dumps(response).encode()
             indent = "\t"  # Backslashes can't be inside of f-strings
@@ -744,8 +854,9 @@ class APIHandler(BaseHTTPRequestHandler):
             process_message_content(messages)
             prompt = self.tokenizer.apply_chat_template(
                 messages,
-                body.get("tools", None),
+                body.get("tools") or None,
                 add_generation_prompt=True,
+                **self.model_provider.cli_args.chat_template_args,
             )
         else:
             prompt = convert_chat(body["messages"], body.get("role_mapping"))
@@ -770,7 +881,7 @@ class APIHandler(BaseHTTPRequestHandler):
         """
         Respond to a GET request from a client.
         """
-        if self.path == "/v1/models":
+        if self.path.startswith("/v1/models"):
             self.handle_models_request()
         elif self.path == "/health":
             self.handle_health_check()
@@ -798,10 +909,17 @@ class APIHandler(BaseHTTPRequestHandler):
 
         files = ["config.json", "model.safetensors.index.json", "tokenizer_config.json"]
 
+        parts = self.path.split("/")
+        filter_repo_id = None
+        if len(parts) > 3:
+            filter_repo_id = "/".join(parts[3:])
+
         def probably_mlx_lm(repo):
             if repo.repo_type != "model":
                 return False
             if "main" not in repo.refs:
+                return False
+            if filter_repo_id is not None and repo.repo_id != filter_repo_id:
                 return False
             file_names = {f.file_path.name for f in repo.refs["main"].files}
             return all(f in file_names for f in files)
@@ -891,6 +1009,12 @@ def main():
         default=None,
     )
     parser.add_argument(
+        "--num-draft-tokens",
+        type=int,
+        help="Number of tokens to draft when using speculative decoding.",
+        default=3,
+    )
+    parser.add_argument(
         "--trust-remote-code",
         action="store_true",
         help="Enable trusting remote code for tokenizer",
@@ -913,6 +1037,42 @@ def main():
         "--use-default-chat-template",
         action="store_true",
         help="Use the default chat template",
+    )
+    parser.add_argument(
+        "--temp",
+        type=float,
+        default=0.0,
+        help="Default sampling temperature (default: 0.0)",
+    )
+    parser.add_argument(
+        "--top-p",
+        type=float,
+        default=1.0,
+        help="Default nucleus sampling top-p (default: 1.0)",
+    )
+    parser.add_argument(
+        "--top-k",
+        type=int,
+        default=0,
+        help="Default top-k sampling (default: 0, disables top-k)",
+    )
+    parser.add_argument(
+        "--min-p",
+        type=float,
+        default=0.0,
+        help="Default min-p sampling (default: 0.0, disables min-p)",
+    )
+    parser.add_argument(
+        "--max-tokens",
+        type=int,
+        default=512,
+        help="Default maximum number of tokens to generate (default: 512)",
+    )
+    parser.add_argument(
+        "--chat-template-args",
+        type=json.loads,
+        help="""A JSON formatted string of arguments for the tokenizer's apply_chat_template, e.g. '{"enable_thinking":false}'""",
+        default="{}",
     )
     args = parser.parse_args()
 

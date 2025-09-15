@@ -3,6 +3,7 @@
 import copy
 import glob
 import importlib
+import inspect
 import json
 import logging
 import os
@@ -26,34 +27,28 @@ if os.getenv("MLXLM_USE_MODELSCOPE", "False").lower() == "true":
     try:
         from modelscope import snapshot_download
     except ImportError:
-        raise ImportError(
-            "Please run `pip install modelscope` to activate the ModelScope."
-        )
+        raise ImportError("Run `pip install modelscope` to use ModelScope.")
 else:
     from huggingface_hub import snapshot_download
 
-from mlx.utils import tree_flatten, tree_reduce
+from mlx.utils import tree_flatten, tree_map, tree_reduce
 from transformers import PreTrainedTokenizer
 
 # Local imports
 from .tokenizer_utils import TokenizerWrapper, load_tokenizer
 from .tuner.utils import dequantize as dequantize_model
-from .tuner.utils import load_adapters, nparams
+from .tuner.utils import get_total_parameters, load_adapters
 
 # Constants
 MODEL_REMAPPING = {
-    "mistral": "llama",  # mistral is compatible with llama
+    "mistral": "llama",
     "phi-msft": "phixtral",
     "falcon_mamba": "mamba",
+    "kimi_k2": "deepseek_v3",
+    "qwen2_5_vl": "qwen2_vl",
 }
 
 MAX_FILE_SIZE_GB = 5
-
-
-class ModelNotFoundError(Exception):
-    def __init__(self, message):
-        self.message = message
-        super().__init__(self.message)
 
 
 def _get_classes(config: dict):
@@ -82,14 +77,13 @@ def compute_bits_per_weight(model):
     model_bytes = tree_reduce(
         lambda acc, x: acc + x.nbytes if isinstance(x, mx.array) else acc, model, 0
     )
-    leaf_modules = tree_flatten(
-        model.leaf_modules(), is_leaf=lambda m: isinstance(m, nn.Module)
-    )
-    model_params = sum(nparams(m) for _, m in leaf_modules)
+    model_params = get_total_parameters(model)
     return model_bytes * 8 / model_params
 
 
-def get_model_path(path_or_hf_repo: str, revision: Optional[str] = None) -> Path:
+def get_model_path(
+    path_or_hf_repo: str, revision: Optional[str] = None
+) -> Tuple[Path, Optional[str]]:
     """
     Ensures the model is available locally. If the path does not exist locally,
     it is downloaded from the Hugging Face Hub.
@@ -99,37 +93,39 @@ def get_model_path(path_or_hf_repo: str, revision: Optional[str] = None) -> Path
         revision (str, optional): A revision id which can be a branch name, a tag, or a commit hash.
 
     Returns:
-        Path: The path to the model.
+        Tuple[Path, str]: A tuple containing the local file path and the Hugging Face repo ID.
     """
     model_path = Path(path_or_hf_repo)
 
     if not model_path.exists():
-        try:
-            model_path = Path(
-                snapshot_download(
-                    path_or_hf_repo,
-                    revision=revision,
-                    allow_patterns=[
-                        "*.json",
-                        "*.safetensors",
-                        "*.py",
-                        "tokenizer.model",
-                        "*.tiktoken",
-                        "tiktoken.model",
-                        "*.txt",
-                        "*.jsonl",
-                    ],
-                )
+        hf_path = path_or_hf_repo
+        model_path = Path(
+            snapshot_download(
+                path_or_hf_repo,
+                revision=revision,
+                allow_patterns=[
+                    "*.json",
+                    "model*.safetensors",
+                    "*.py",
+                    "tokenizer.model",
+                    "*.tiktoken",
+                    "tiktoken.model",
+                    "*.txt",
+                    "*.jsonl",
+                    "*.jinja",
+                ],
             )
-        except:
-            raise ModelNotFoundError(
-                f"Model not found for path or HF repo: {path_or_hf_repo}.\n"
-                "Please make sure you specified the local path or Hugging Face"
-                " repo id correctly.\nIf you are trying to access a private or"
-                " gated Hugging Face repo, make sure you are authenticated:\n"
-                "https://huggingface.co/docs/huggingface_hub/en/guides/cli#huggingface-cli-login"
-            ) from None
-    return model_path
+        )
+    else:
+        from huggingface_hub import ModelCard
+
+        card_path = model_path / "README.md"
+        if card_path.is_file():
+            card = ModelCard.load(card_path)
+            hf_path = card.data.base_model
+        else:
+            hf_path = None
+    return model_path, hf_path
 
 
 def load_config(model_path: Path) -> dict:
@@ -148,7 +144,7 @@ def load_model(
     strict: bool = True,
     model_config: dict = {},
     get_model_classes: Callable[[dict], Tuple[Type[nn.Module], Type]] = _get_classes,
-) -> nn.Module:
+) -> Tuple[nn.Module, dict]:
     """
     Load and initialize the model from a given path.
 
@@ -166,7 +162,7 @@ def load_model(
             Defaults to the ``_get_classes`` function.
 
     Returns:
-        nn.Module: The loaded and initialized model.
+        Tuple[nn.Module, dict[str, Any]]: The loaded and initialized model and config.
 
     Raises:
         FileNotFoundError: If the weight files (.safetensors) are not found.
@@ -176,10 +172,6 @@ def load_model(
     config.update(model_config)
 
     weight_files = glob.glob(str(model_path / "model*.safetensors"))
-
-    if not weight_files:
-        # Try weight for back-compat
-        weight_files = glob.glob(str(model_path / "weight*.safetensors"))
 
     if not weight_files and strict:
         logging.error(f"No safetensors found in {model_path}")
@@ -197,23 +189,38 @@ def load_model(
     if hasattr(model, "sanitize"):
         weights = model.sanitize(weights)
 
-    if (quantization := config.get("quantization", None)) is not None:
-
+    def _quantize(quantization):
         def class_predicate(p, m):
             # Handle custom per layer quantizations
             if p in config["quantization"]:
                 return config["quantization"][p]
             if not hasattr(m, "to_quantized"):
                 return False
-            # Handle legacy models which may not have everything quantized
             return f"{p}.scales" in weights
 
         nn.quantize(
             model,
             group_size=quantization["group_size"],
             bits=quantization["bits"],
+            mode=quantization.get("mode", "affine"),
             class_predicate=class_predicate,
         )
+
+    if (quantization := config.get("quantization", None)) is not None:
+        _quantize(quantization)
+
+    elif quantization_config := config.get("quantization_config", False):
+        # Handle legacy quantization config
+        quant_method = quantization_config["quant_method"]
+        if quant_method == "bitnet":
+            from .models.bitlinear_layers import bitnet_quantize
+
+            model = bitnet_quantize(model, quantization_config)
+        elif quant_method == "mxfp4":
+            quantization = {"group_size": 32, "bits": 4, "mode": "mxfp4"}
+            config["quantization"] = quantization
+            config["quantization_config"] = quantization
+            _quantize(quantization)
 
     model.load_weights(list(weights.items()), strict=strict)
 
@@ -252,7 +259,7 @@ def load(
         FileNotFoundError: If config file or safetensors are not found.
         ValueError: If model class or args class are not found.
     """
-    model_path = get_model_path(path_or_hf_repo)
+    model_path, _ = get_model_path(path_or_hf_repo)
 
     model, config = load_model(model_path, lazy)
     if adapter_path is not None:
@@ -266,11 +273,13 @@ def load(
 
 
 def fetch_from_hub(
-    model_path: Path, lazy: bool = False
+    model_path: Path, lazy: bool = False, trust_remote_code: bool = False
 ) -> Tuple[nn.Module, dict, PreTrainedTokenizer]:
     model, config = load_model(model_path, lazy)
     tokenizer = load_tokenizer(
-        model_path, eos_token_ids=config.get("eos_token_id", None)
+        model_path,
+        eos_token_ids=config.get("eos_token_id", None),
+        tokenizer_config_extra={"trust_remote_code": trust_remote_code},
     )
     return model, config, tokenizer
 
@@ -380,17 +389,18 @@ def upload_to_hub(path: str, upload_repo: str):
     print(f"Upload successful, go to https://huggingface.co/{upload_repo} for details.")
 
 
-def save_weights(
+def save_model(
     save_path: Union[str, Path],
-    weights: Dict[str, Any],
+    model: nn.Module,
     *,
-    donate_weights: bool = False,
+    donate_model: bool = False,
 ) -> None:
-    """Save model weights into specified directory."""
+    """Save model weights and metadata index into specified directory."""
     if isinstance(save_path, str):
         save_path = Path(save_path)
     save_path.mkdir(parents=True, exist_ok=True)
 
+    weights = dict(tree_flatten(model.parameters()))
     shards = make_shards(weights)
     shards_count = len(shards)
     shard_file_format = (
@@ -400,13 +410,20 @@ def save_weights(
     )
 
     total_size = sum(v.nbytes for v in weights.values())
-    index_data = {"metadata": {"total_size": total_size}, "weight_map": {}}
+    index_data = {
+        "metadata": {
+            "total_size": total_size,
+            "total_parameters": get_total_parameters(model),
+        },
+        "weight_map": {},
+    }
+    if donate_model:
+        model.update(tree_map(lambda _: mx.array([]), model.parameters()))
 
     # Write the weights and make sure no references are kept other than the
     # necessary ones
-    if donate_weights:
-        weights.clear()
-        del weights
+    weights.clear()
+    del weights
 
     for i in range(len(shards)):
         shard = shards[i]
@@ -435,20 +452,22 @@ def save_weights(
 def quantize_model(
     model: nn.Module,
     config: dict,
-    q_group_size: int,
-    q_bits: int,
+    group_size: int,
+    bits: int,
+    mode: str = "affine",
     quant_predicate: Optional[
         Callable[[str, nn.Module, dict], Union[bool, dict]]
     ] = None,
-) -> Tuple:
+) -> Tuple[nn.Module, dict]:
     """
     Applies quantization to the model weights.
 
     Args:
         model (nn.Module): The model to be quantized.
         config (dict): Model configuration.
-        q_group_size (int): Group size for quantization.
-        q_bits (int): Bits per weight for quantization.
+        group_size (int): Group size for quantization.
+        bits (int): Bits per weight for quantization.
+        mode (str): The quantization mode.
         quant_predicate (Callable): A callable that decides how
             to quantize each layer based on the path.
             Accepts the layer `path`, the `module` and the model `config`.
@@ -456,31 +475,48 @@ def quantize_model(
             a dict of quantization parameters to pass to `to_quantized`.
 
     Returns:
-        Tuple: Tuple containing quantized weights and config.
+        Tuple: Tuple containing quantized model and config.
     """
     quantized_config = copy.deepcopy(config)
-    quantized_config["quantization"] = {"group_size": q_group_size, "bits": q_bits}
 
-    # Add any custom quantization parameters to the config as we go
-    def _class_predicate(p, m):
-        bool_or_params = quant_predicate(p, m, config)
-        quantized_config["quantization"][p] = bool_or_params
+    quant_predicate = quant_predicate or getattr(model, "quant_predicate", None)
+    quant_params = {"group_size": group_size, "bits": bits, "mode": mode}
+    if "quantization" in quantized_config:
+        # If the model is already partially quantized, return params so that
+        # the config is set on a per-layer basis
+        fine_grained_config = True
+    else:
+        fine_grained_config = False
+        quantized_config["quantization"] = quant_params
+
+    def wrapped_predicate(path, module):
+        if not hasattr(module, "to_quantized"):
+            return False
+        if module.weight.shape[-1] % group_size != 0:
+            return False
+        bool_or_params = True
+        if quant_predicate is not None:
+            bool_or_params = quant_predicate(path, module)
+        if isinstance(bool_or_params, dict):
+            quantized_config["quantization"][path] = bool_or_params
+        elif fine_grained_config and bool_or_params:
+            quantized_config["quantization"][path] = quant_params
         return bool_or_params
 
     nn.quantize(
         model,
-        q_group_size,
-        q_bits,
-        class_predicate=_class_predicate if quant_predicate else None,
+        group_size,
+        bits,
+        mode=mode,
+        class_predicate=wrapped_predicate,
     )
     # support hf model tree #957
     quantized_config["quantization_config"] = quantized_config["quantization"]
-    quantized_weights = dict(tree_flatten(model.parameters()))
 
     bpw = compute_bits_per_weight(model)
     print(f"[INFO] Quantized model with {bpw:.3f} bits per weight.")
 
-    return quantized_weights, quantized_config
+    return model, quantized_config
 
 
 def save_config(
@@ -498,6 +534,8 @@ def save_config(
     # Clean unused keys
     config.pop("_name_or_path", None)
     config.pop("vision_config", None)
+    if "quantization" in config:
+        config["quantization_config"] = config["quantization"]
 
     # sort the config for better readability
     config = dict(sorted(config.items()))
@@ -510,15 +548,15 @@ def save_config(
 def save(
     dst_path: Union[str, Path],
     src_path: Union[str, Path],
-    weights: Dict[str, mx.array],
+    model: nn.Module,
     tokenizer: TokenizerWrapper,
     config: Dict[str, Any],
     hf_repo: Optional[str] = None,
-    donate_weights: bool = True,
+    donate_model: bool = True,
 ):
     src_path = Path(src_path)
     dst_path = Path(dst_path)
-    save_weights(dst_path, weights, donate_weights=True)
+    save_model(dst_path, model, donate_model=True)
     save_config(config, config_path=dst_path / "config.json")
     tokenizer.save_pretrained(dst_path)
 
@@ -554,3 +592,18 @@ def common_prefix_len(list1, list2):
     # No mismatch found within the bounds of the shorter list,
     # so the common prefix length is the length of the shorter list.
     return min_len
+
+
+def does_model_support_input_embeddings(model: nn.Module) -> bool:
+    """
+    Check if the model supports input_embeddings in its call signature.
+    Args:
+        model (nn.Module): The model to check.
+    Returns:
+        bool: True if the model supports input_embeddings, False otherwise.
+    """
+    try:
+        signature = inspect.signature(model.__call__)
+        return "input_embeddings" in signature.parameters
+    except (ValueError, TypeError):
+        return False

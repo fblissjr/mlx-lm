@@ -1,16 +1,13 @@
 # Copyright © 2024 Apple Inc.
 
-import math
 from dataclasses import dataclass
-from functools import partial
-from typing import Any, Dict, Optional, Tuple, Union
+from typing import Any, Dict, Optional, Union
 
 import mlx.core as mx
 import mlx.nn as nn
 
-from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
+from .base import BaseModelArgs
 from .deepseek_v3 import DeepseekV3Model
-from .switch_layers import SwitchGLU
 
 
 @dataclass
@@ -33,9 +30,9 @@ class TextArgs(BaseModelArgs):
     topk_method: str = "noaux_tc"
     scoring_func: str = "sigmoid"
     norm_topk_prob: bool = True
-    n_group: Optional[int] = None
-    topk_group: Optional[int] = None
-    num_experts_per_tok: Optional[int] = None
+    n_group: int = 1
+    topk_group: int = 1
+    num_experts_per_tok: int = 1
     moe_layer_freq: int = 1
     first_k_dense_replace: int = 0
     max_position_embeddings: int = 2048
@@ -65,9 +62,8 @@ class LanguageModel(nn.Module):
         self,
         inputs: mx.array,
         cache: Optional[Any] = None,
-        mask: Optional[mx.array] = None,
     ):
-        out = self.model(inputs, cache, mask)
+        out = self.model(inputs, cache)
         return self.lm_head(out)
 
 
@@ -82,9 +78,8 @@ class Model(nn.Module):
         self,
         inputs: mx.array,
         cache: Optional[Any] = None,
-        mask: Optional[mx.array] = None,
     ):
-        return self.language_model(inputs, cache, mask)
+        return self.language_model(inputs, cache)
 
     def sanitize(self, weights):
         def keep(key):
@@ -113,6 +108,7 @@ class Model(nn.Module):
     def layers(self):
         return self.language_model.model.layers
 
+    @property
     def cast_predicate(self):
         def predicate(k):
             return "e_score_correction_bias" not in k

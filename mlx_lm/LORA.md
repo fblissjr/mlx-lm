@@ -26,6 +26,12 @@ LoRA (QLoRA).[^qlora] LoRA fine-tuning works with the following model families:
 
 ## Run
 
+First, make sure you have the training dependenices installed:
+
+```shell
+pip install "mlx-lm[train]"
+```
+
 The main command is `mlx_lm.lora`. To see a full list of command-line options run:
 
 ```shell
@@ -75,6 +81,17 @@ You can specify the output location with `--adapter-path`.
 
 You can resume fine-tuning with an existing adapter with
 `--resume-adapter-file <path_to_adapters.safetensors>`.
+
+#### Logging
+
+You can log training metrics to Weights & Biases using `--report-to wandb`, or
+to SwanLab using `--report-to swanlab`. Make sure to install the required
+packages beforehand: `pip install wandb` or `pip install swanlab`. You can
+enable both tracking tools simultaneously by separating them with a comma, for
+example: `--report-to wandb,swanlab`.
+
+To specify a project name for the logging tracker, use `--project-name <YOUR
+PROJECT NAME>`.
 
 #### Prompt Masking
 
@@ -379,7 +396,7 @@ mlx_lm.lora \
     --train \
     --batch-size 1 \
     --num-layers 4 \
-    --data wikisql
+    --data  mlx-community/wikisql
 ```
 
 The above command on an M1 Max with 32 GB runs at about 250

@@ -6,7 +6,7 @@ from typing import Callable, Optional, Union
 
 import mlx.core as mx
 import mlx.nn as nn
-from mlx.utils import tree_flatten
+from mlx.utils import tree_map_with_path
 
 from .utils import (
     dequantize_model,
@@ -19,11 +19,9 @@ from .utils import (
 
 
 def mixed_quant_predicate_builder(
-    recipe: str, model: nn.Module
+    recipe: str, model: nn.Module, group_size: int = 64
 ) -> Callable[[str, nn.Module, dict], Union[bool, dict]]:
-
     high_bits = 6
-    group_size = 64
 
     if recipe == "mixed_2_6":
         low_bits = 2
@@ -35,7 +33,7 @@ def mixed_quant_predicate_builder(
     elif recipe == "mixed_4_6":
         low_bits = 4
     else:
-        raise ValueError("Invalid quant recipe {recipe}")
+        raise ValueError(f"Invalid quant recipe {recipe}")
 
     down_keys = [k for k, _ in model.named_modules() if "down_proj" in k]
     if len(down_keys) == 0:
@@ -50,16 +48,11 @@ def mixed_quant_predicate_builder(
     def mixed_quant_predicate(
         path: str,
         module: nn.Module,
-        config: dict,
     ) -> Union[bool, dict]:
         """Implements mixed quantization predicates with similar choices to, for example, llama.cpp's Q4_K_M.
         Ref: https://github.com/ggerganov/llama.cpp/blob/917786f43d0f29b7c77a0c56767c0fa4df68b1c5/src/llama.cpp#L5265
         By Alex Barron: https://gist.github.com/barronalex/84addb8078be21969f1690c1454855f3
         """
-
-        if not hasattr(module, "to_quantized"):
-            return False
-
         index = (
             int(path.split(".")[layer_location])
             if len(path.split(".")) > layer_location
@@ -93,6 +86,7 @@ def convert(
     quantize: bool = False,
     q_group_size: int = 64,
     q_bits: int = 4,
+    q_mode: str = "affine",
     dtype: Optional[str] = None,
     upload_repo: str = None,
     revision: Optional[str] = None,
@@ -100,6 +94,7 @@ def convert(
     quant_predicate: Optional[
         Union[Callable[[str, nn.Module, dict], Union[bool, dict]], str]
     ] = None,
+    trust_remote_code: bool = False,
 ):
     # Check the save path is empty
     if isinstance(mlx_path, str):
@@ -112,47 +107,55 @@ def convert(
         )
 
     print("[INFO] Loading")
-    model_path = get_model_path(hf_path, revision=revision)
-    model, config, tokenizer = fetch_from_hub(model_path, lazy=True)
+    model_path, hf_path = get_model_path(hf_path, revision=revision)
+    model, config, tokenizer = fetch_from_hub(
+        model_path, lazy=True, trust_remote_code=trust_remote_code
+    )
 
     if isinstance(quant_predicate, str):
-        quant_predicate = mixed_quant_predicate_builder(quant_predicate, model)
+        quant_predicate = mixed_quant_predicate_builder(
+            quant_predicate, model, q_group_size
+        )
 
     if dtype is None:
         dtype = config.get("torch_dtype", None)
-    weights = dict(tree_flatten(model.parameters()))
     if dtype in MODEL_CONVERSION_DTYPES:
         print("[INFO] Using dtype:", dtype)
         dtype = getattr(mx, dtype)
+        cast_predicate = getattr(model, "cast_predicate", lambda _: True)
 
-        if hasattr(model, "cast_predicate"):
-            cast_predicate = model.cast_predicate()
-        else:
-            cast_predicate = lambda _: True
-        weights = {
-            k: v.astype(dtype) if cast_predicate(k) else v for k, v in weights.items()
-        }
+        def set_dtype(k, v):
+            if cast_predicate(k) and mx.issubdtype(v.dtype, mx.floating):
+                return v.astype(dtype)
+            else:
+                return v
+
+        model.update(tree_map_with_path(set_dtype, model.parameters()))
 
     if quantize and dequantize:
         raise ValueError("Choose either quantize or dequantize, not both.")
 
     if quantize:
         print("[INFO] Quantizing")
-        model.load_weights(list(weights.items()))
-        weights, config = quantize_model(
-            model, config, q_group_size, q_bits, quant_predicate=quant_predicate
+        model, config = quantize_model(
+            model,
+            config,
+            q_group_size,
+            q_bits,
+            mode=q_mode,
+            quant_predicate=quant_predicate,
         )
 
     if dequantize:
         print("[INFO] Dequantizing")
+        config.pop("quantization", None)
+        config.pop("quantization_config", None)
         model = dequantize_model(model)
-        weights = dict(tree_flatten(model.parameters()))
 
-    del model
     save(
         mlx_path,
         model_path,
-        weights,
+        model,
         tokenizer,
         config,
         hf_repo=hf_path,
@@ -187,6 +190,13 @@ def configure_parser() -> argparse.ArgumentParser:
         "--q-bits", help="Bits per weight for quantization.", type=int, default=4
     )
     parser.add_argument(
+        "--q-mode",
+        help="The quantization mode.",
+        type=str,
+        default="affine",
+        choices=["affine", "mxfp4"],
+    )
+    parser.add_argument(
         "--quant-predicate",
         help=f"Mixed-bit quantization recipe.",
         choices=QUANT_RECIPES,
@@ -210,6 +220,12 @@ def configure_parser() -> argparse.ArgumentParser:
         "-d",
         "--dequantize",
         help="Dequantize a quantized model.",
+        action="store_true",
+        default=False,
+    )
+    parser.add_argument(
+        "--trust-remote-code",
+        help="Trust remote code when loading tokenizer.",
         action="store_true",
         default=False,
     )

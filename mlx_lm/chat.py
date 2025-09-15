@@ -1,7 +1,6 @@
 # Copyright © 2023-2024 Apple Inc.
 
 import argparse
-import json
 
 import mlx.core as mx
 
@@ -27,6 +26,11 @@ def setup_arg_parser():
         type=str,
         help="The path to the local model directory or Hugging Face repo.",
         default=DEFAULT_MODEL,
+    )
+    parser.add_argument(
+        "--trust-remote-code",
+        action="store_true",
+        help="Enable trusting remote code for tokenizer",
     )
     parser.add_argument(
         "--adapter-path",
@@ -70,6 +74,11 @@ def setup_arg_parser():
         default=DEFAULT_MAX_TOKENS,
         help="Maximum number of tokens to generate",
     )
+    parser.add_argument(
+        "--system-prompt",
+        default=None,
+        help="System prompt to be used for the chat template",
+    )
     return parser
 
 
@@ -83,7 +92,9 @@ def main():
     model, tokenizer = load(
         args.model,
         adapter_path=args.adapter_path,
-        tokenizer_config={"trust_remote_code": True},
+        tokenizer_config={
+            "trust_remote_code": True if args.trust_remote_code else None
+        },
     )
 
     def print_help():
@@ -105,7 +116,10 @@ def main():
         if query == "h":
             print_help()
             continue
-        messages = [{"role": "user", "content": query}]
+        messages = []
+        if args.system_prompt is not None:
+            messages.append({"role": "system", "content": args.system_prompt})
+        messages.append({"role": "user", "content": query})
         prompt = tokenizer.apply_chat_template(messages, add_generation_prompt=True)
         for response in stream_generate(
             model,

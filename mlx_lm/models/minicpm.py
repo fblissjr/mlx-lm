@@ -7,6 +7,7 @@ import mlx.core as mx
 import mlx.nn as nn
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
+from .rope_utils import initialize_rope
 
 
 @dataclass
@@ -22,6 +23,7 @@ class ModelArgs(BaseModelArgs):
     num_key_value_heads: int
     scale_depth: float
     scale_emb: float
+    max_position_embeddings: Optional[int] = None
     rope_theta: float = 1000000.0
     rope_traditional: bool = False
     rope_scaling: Optional[Dict[str, Union[str, float]]] = None
@@ -67,17 +69,12 @@ class Attention(nn.Module):
             self.num_heads * self.head_dim, self.hidden_size, bias=False
         )
 
-        rope_scale = (
-            1 / args.rope_scaling["factor"]
-            if args.rope_scaling is not None and args.rope_scaling["type"] == "linear"
-            else 1
-        )
-
-        self.rope = nn.RoPE(
-            dims=self.head_dim,
-            traditional=args.rope_traditional,
-            base=self.rope_theta,
-            scale=rope_scale,
+        self.rope = initialize_rope(
+            self.head_dim,
+            args.rope_theta,
+            args.rope_traditional,
+            args.rope_scaling,
+            args.max_position_embeddings,
         )
 
     def __call__(
@@ -157,16 +154,14 @@ class MiniCPMModel(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
-        mask: mx.array = None,
         cache=None,
     ):
         h = self.embed_tokens(inputs) * self.args.scale_emb
 
-        if mask is None:
-            mask = create_attention_mask(h, cache)
-
         if cache is None:
             cache = [None] * len(self.layers)
+
+        mask = create_attention_mask(h, cache[0])
 
         for layer, c in zip(self.layers, cache):
             h = layer(h, mask, c)
@@ -187,10 +182,9 @@ class Model(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
-        mask: mx.array = None,
         cache=None,
     ):
-        out = self.model(inputs, mask, cache)
+        out = self.model(inputs, cache)
 
         if not self.args.tie_word_embeddings:
             out = self.lm_head(out / (self.args.hidden_size / self.args.dim_model_base))

@@ -5,7 +5,6 @@ from typing import Any, Optional
 
 import mlx.core as mx
 import mlx.nn as nn
-import numpy as np
 
 from .base import BaseModelArgs, create_attention_mask, scaled_dot_product_attention
 
@@ -126,25 +125,23 @@ class GPT2Model(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
-        mask: mx.array = None,
         cache=None,
     ):
         _, L = inputs.shape
 
         hidden_states = self.wte(inputs)
 
+        if cache is None:
+            cache = [None] * len(self.h)
+
         offset = 0
-        if cache is not None and len(cache) > 0 and cache[0] is not None:
+        if cache[0] is not None:
             offset = cache[0].offset
 
         position_ids = mx.arange(offset, offset + L)
         hidden_states += self.wpe(position_ids)
 
-        if mask is None:
-            mask = create_attention_mask(hidden_states, cache)
-
-        if cache is None:
-            cache = [None] * len(self.h)
+        mask = create_attention_mask(hidden_states, cache[0])
 
         for layer, c in zip(self.h, cache):
             hidden_states = layer(hidden_states, mask, cache=c)
@@ -162,10 +159,9 @@ class Model(nn.Module):
     def __call__(
         self,
         inputs: mx.array,
-        mask: mx.array = None,
         cache=None,
     ):
-        out = self.model(inputs, mask, cache)
+        out = self.model(inputs, cache)
         out = self.model.wte.as_linear(out)
         return out
 

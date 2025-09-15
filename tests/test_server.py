@@ -1,6 +1,7 @@
 # Copyright © 2024 Apple Inc.
 
 import http
+import io
 import json
 import threading
 import unittest
@@ -28,6 +29,13 @@ class DummyModelProvider:
                 "chat_template": None,
                 "use_default_chat_template": False,
                 "trust_remote_code": False,
+                "num_draft_tokens": 3,
+                "temp": 0.0,
+                "top_p": 1.0,
+                "top_k": 0,
+                "min_p": 0.0,
+                "max_tokens": 512,
+                "chat_template_args": {},
             },
         )
 
@@ -72,15 +80,21 @@ class TestServer(unittest.TestCase):
             "top_p": 0.9,
             "repetition_penalty": 1.1,
             "repetition_context_size": 20,
+            "seed": 999,
             "stop": "stop sequence",
         }
 
         response = requests.post(url, json=post_data)
 
-        response_body = response.text
+        response_body = json.loads(response.text)
 
         self.assertIn("id", response_body)
         self.assertIn("choices", response_body)
+        first_text = response_body["choices"][0]["text"]
+        self.assertEqual(
+            first_text,
+            json.loads(requests.post(url, json=post_data).text)["choices"][0]["text"],
+        )
 
     def test_handle_chat_completions(self):
         url = f"http://localhost:{self.port}/v1/chat/completions"
@@ -116,6 +130,38 @@ class TestServer(unittest.TestCase):
                     ],
                 },
                 {"role": "user", "content": [{"type": "text", "text": "Hello!"}]},
+            ],
+        }
+        response = requests.post(url, json=chat_post_data)
+        response_body = response.text
+        self.assertIn("id", response_body)
+        self.assertIn("choices", response_body)
+
+    def test_handle_chat_completions_with_null_tool_content(self):
+        url = f"http://localhost:{self.port}/v1/chat/completions"
+        chat_post_data = {
+            "model": "chat_model",
+            "max_tokens": 10,
+            "temperature": 0.7,
+            "top_p": 0.85,
+            "repetition_penalty": 1.2,
+            "messages": [
+                {"role": "user", "content": "what is 2+3?"},
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {
+                            "type": "function",
+                            "id": "123",
+                            "function": {
+                                "name": "add",
+                                "arguments": '{"a": 2, "b": 3}',
+                            },
+                        }
+                    ],
+                },
+                {"role": "tool", "content": "5", "tool_call_id": "123"},
             ],
         }
         response = requests.post(url, json=chat_post_data)
@@ -350,7 +396,9 @@ class TestGetPromptCache(unittest.TestCase):
         self.assertEqual(self.handler.prompt_cache.model_key, ("model_v1", None, None))
         mock_make_cache.assert_called_once()
 
-    def test_identical_request_full_hit(self):
+    @patch("mlx_lm.server.trim_prompt_cache")
+    @patch("mlx_lm.server.can_trim_prompt_cache", return_value=True)
+    def test_identical_request_full_hit(self, mock_can_trim, mock_trim_cache):
         """Test when the new prompt is identical to the cached one."""
         self.handler.prompt_cache.tokens = [1, 2, 3]
         self.handler.prompt_cache.model_key = ("model_v1", None, None)
@@ -361,10 +409,9 @@ class TestGetPromptCache(unittest.TestCase):
         with patch("mlx_lm.server.common_prefix_len", return_value=3):
             processed_prompt = self.handler.get_prompt_cache(prompt)
 
-        # Should process nothing, cache remains unchanged
-        self.assertEqual(processed_prompt, [])
+        mock_trim_cache.assert_called_once_with("existing_cache_obj", 1)
+        self.assertEqual(processed_prompt, [3])
         self.assertEqual(self.handler.prompt_cache.tokens, [1, 2, 3])
-        self.assertEqual(self.handler.prompt_cache.cache, "existing_cache_obj")
 
     def test_cache_is_prefix(self):
         """Test when the cached prompt is a prefix of the new prompt."""
@@ -466,6 +513,56 @@ class TestGetPromptCache(unittest.TestCase):
         mock_make_cache.assert_called_once()
         self.assertEqual(self.handler.prompt_cache.cache, "new_cache_obj_model_change")
         self.assertEqual(self.handler.prompt_cache.model_key, ("model_v2", None, None))
+
+
+class TestKeepalive(unittest.TestCase):
+
+    def test_keepalive_callback(self):
+        """Test keepalive callback sends SSE comments and handles errors"""
+        from unittest.mock import Mock
+
+        # Mock handler
+        mock_wfile = io.BytesIO()
+        handler = Mock()
+        handler.wfile = mock_wfile
+
+        # Test callback logic (same as in server.py)
+        def keepalive_callback(processed_tokens, total_tokens):
+            if handler.stream:
+                try:
+                    handler.wfile.write(
+                        f": keepalive {processed_tokens}/{total_tokens}\n\n".encode()
+                    )
+                    handler.wfile.flush()
+                except (BrokenPipeError, ConnectionResetError, OSError):
+                    pass
+
+        # Test streaming enabled
+        handler.stream = True
+        keepalive_callback(1024, 4096)
+
+        output = mock_wfile.getvalue().decode("utf-8")
+        self.assertEqual(output, ": keepalive 1024/4096\n\n")
+
+        # Test streaming disabled
+        handler.stream = False
+        mock_wfile.seek(0)
+        mock_wfile.truncate(0)
+        keepalive_callback(2048, 4096)
+
+        output = mock_wfile.getvalue().decode("utf-8")
+        self.assertEqual(output, "")
+
+        # Test error handling
+        handler.stream = True
+        handler.wfile = Mock()
+        handler.wfile.write.side_effect = BrokenPipeError("Connection broken")
+
+        # Should not raise exception
+        try:
+            keepalive_callback(3072, 4096)
+        except Exception as e:
+            self.fail(f"Callback should handle BrokenPipeError: {e}")
 
 
 if __name__ == "__main__":
