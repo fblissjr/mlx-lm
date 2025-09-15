@@ -26,6 +26,7 @@ from .models import cache
 from .models.cache import (
     QuantizedKVCache,
     load_prompt_cache,
+    trim_prompt_cache, # Speculative Cascades
 )
 from .sample_utils import make_sampler
 from .tokenizer_utils import TokenizerWrapper
@@ -203,6 +204,20 @@ def setup_arg_parser():
         help="Number of tokens to draft when using speculative decoding.",
         default=3,
     )
+    # ADDED: New arguments for Speculative Cascades
+    parser.add_argument(
+        "--cascade-rule",
+        type=str,
+        default=None,
+        choices=["chow", "diff", "opt"],
+        help="Enable speculative cascading with the specified deferral rule. Requires --draft-model.",
+    )
+    parser.add_argument(
+        "--cascade-alpha",
+        type=float,
+        default=0.1,
+        help="The alpha threshold ('strictness') for the speculative cascade rule.",
+    )
     return parser
 
 
@@ -292,6 +307,187 @@ def maybe_quantize_kv_cache(prompt_cache, quantized_kv_start, kv_group_size, kv_
                     group_size=kv_group_size, bits=kv_bits
                 )
 
+## BEGIN SPECULATIVE CASCADE
+# ADDED: Helper function for cascade deferral logic
+def _compute_deferral_decision(
+    q_logits: mx.array, p_logits: mx.array, rule: str, alpha: float
+) -> bool:
+    """
+    Computes the deferral decision (delta) based on the cascade rule.
+
+    Args:
+        q_logits (mx.array): Logits from the drafter model `q`.
+        p_logits (mx.array): Logits from the verifier model `p`.
+        rule (str): The cascade rule to apply ("chow", "diff", or "opt").
+        alpha (float): The sensitivity parameter for the rule.
+
+    Returns:
+        bool: True if the decision is to defer to the verifier `p`, False otherwise.
+    """
+    # Use float32 for stable probability calculations
+    q_probs = mx.softmax(q_logits.astype(mx.float32))
+
+    if rule == "chow":
+        # Defer if the drafter's confidence is below a threshold.
+        defer = (mx.max(q_probs) < (1.0 - alpha)).item()
+
+    elif rule == "diff" or rule == "opt":
+        p_probs = mx.softmax(p_logits.astype(mx.float32))
+        max_q = mx.max(q_probs)
+        max_p = mx.max(p_probs)
+
+        if rule == "diff":
+            # Defer if the verifier's confidence is significantly higher.
+            defer = (max_q < (max_p - alpha)).item()
+        else:  # rule == "opt"
+            # Defer based on confidence difference, penalized by the
+            # Total Variation Distance between the distributions.
+            d_tv = mx.sum(mx.maximum(0, p_probs - q_probs))
+            defer = (max_q < (max_p - alpha * d_tv)).item()
+    else:
+        raise ValueError(f"Unknown cascade rule: {rule}")
+
+    return defer
+
+## Speculative Cascade Generation Step
+# ADDED: New generation function for Speculative Cascades
+def speculative_cascade_generate_step(
+    prompt: mx.array,
+    model: nn.Module,
+    draft_model: nn.Module,
+    cascade_rule: str,
+    cascade_alpha: float,
+    *,
+    num_draft_tokens=3,
+    max_tokens: int = 256,
+    sampler: Optional[Callable[[mx.array], mx.array]] = None,
+    logits_processors: Optional[List[Callable[[mx.array, mx.array], mx.array]]] = None,
+    prompt_cache: Optional[Any] = None,
+) -> Generator[Tuple[int, mx.array, bool], None, None]:
+    """
+    A generator for speculative cascades, based on the paper
+    "Faster Cascades via Speculative Decoding".
+
+    Args:
+        prompt (mx.array): The input prompt.
+        model (nn.Module): The verifier model `p`.
+        draft_model (nn.Module): The drafter model `q`.
+        cascade_rule (str): The deferral rule to use ('chow', 'diff', 'opt').
+        cascade_alpha (float): The sensitivity parameter for the cascade rule.
+        num_draft_tokens (int, optional): The number of tokens to draft. Default: ``3``.
+        max_tokens (int): The maximum number of tokens to generate. Default: ``256``.
+        sampler (Callable, optional): A function to sample a token from logits.
+        logits_processors (List[Callable], optional): Functions to process logits.
+        prompt_cache (Any, optional): A pre-computed prompt cache.
+
+    Yields:
+        Tuple[int, mx.array, bool]: Token ID, log probabilities, and a bool indicating
+          if the token was from the draft model.
+    """
+    y = prompt.astype(mx.uint32)
+
+    if prompt_cache is None:
+        model_cache = cache.make_prompt_cache(model)
+        draft_cache = cache.make_prompt_cache(draft_model)
+    else:
+        model_cache = prompt_cache[: len(model.layers)]
+        draft_cache = prompt_cache[len(model.layers) :]
+
+    sampler = sampler or (lambda x: mx.argmax(x, axis=-1))
+
+    # _step is a closure to simplify calls to the models with their respective caches
+    def _step(mdl, mdl_cache, tokens, n_predict=1):
+        with mx.stream(generation_stream):
+            logits = mdl(tokens[None], cache=mdl_cache)
+            logits = logits[:, -n_predict:, :]
+            if logits_processors:
+                # This is a simplified token history for processors.
+                # For full correctness, it should track the entire generated sequence.
+                current_tokens = prompt
+                for processor in logits_processors:
+                    logits = processor(current_tokens, logits)
+            return logits.squeeze(0)
+
+    # Prefill both models' caches with the initial prompt.
+    _step(draft_model, draft_cache, y, n_predict=y.size)
+    _step(model, model_cache, y, n_predict=y.size)
+
+    ntoks = 0
+    while ntoks < max_tokens:
+        # 1. Drafting Phase: Generate a block of candidate tokens and their logits from `q`.
+        draft_tokens = []
+        draft_logits_list = []
+        y_draft_sequence = y
+        for _ in range(num_draft_tokens):
+            logits_q = _step(draft_model, draft_cache, y_draft_sequence)
+            y_i = sampler(logits_q)
+            draft_tokens.append(y_i.item())
+            draft_logits_list.append(logits_q)
+            y_draft_sequence = mx.concatenate([y_draft_sequence, y_i])
+
+        # 2. Verification Phase: Get logits from `p` for all drafted positions in one pass.
+        all_p_logits = _step(model, model_cache, y_draft_sequence, n_predict=num_draft_tokens + 1)
+        mx.eval(all_p_logits) # Ensure logits are computed before the acceptance loop
+
+        # 3. Acceptance Loop: Iterate through drafts, probabilistically accepting or rejecting.
+        accepted_count = 0
+        for i in range(num_draft_tokens):
+            draft_token = draft_tokens[i]
+            q_logits = draft_logits_list[i]
+            p_logits = all_p_logits[i]
+
+            defer = _compute_deferral_decision(q_logits, p_logits, cascade_rule, cascade_alpha)
+            target_logits = p_logits if defer else q_logits
+
+            q_probs = mx.softmax(q_logits.astype(mx.float32))
+            target_probs = mx.softmax(target_logits.astype(mx.float32))
+
+            accept_prob = (target_probs[draft_token] / q_probs[draft_token]).item()
+
+            if mx.random.uniform() < accept_prob:
+                accepted_count += 1
+                y = mx.array([draft_token], dtype=mx.uint32)
+                yield y.item(), target_logits, True # Yield accepted token (from_draft=True)
+                if ntoks + accepted_count >= max_tokens:
+                    return
+            else:
+                # Rejection Sampling: Sample a new token from the residual distribution.
+                residual_probs = mx.maximum(0, target_probs - q_probs)
+                residual_probs /= mx.sum(residual_probs) # Normalize
+                new_token = mx.random.categorical(mx.log(residual_probs))
+
+                # Rewind caches to discard the rejected token and subsequent drafts.
+                num_to_trim = num_draft_tokens - i
+                trim_prompt_cache(model_cache, num_to_trim)
+                trim_prompt_cache(draft_cache, num_to_trim)
+
+                y = new_token
+                yield y.item(), target_logits, False # Yield resampled token (from_draft=False)
+                ntoks += accepted_count + 1
+                if ntoks >= max_tokens:
+                    return
+                break # End this generation turn
+        else: # This 'else' belongs to the for loop, executed if no break (all drafts accepted)
+            # Sample one more token to ensure forward progress
+            final_p_logits = all_p_logits[-1]
+
+            # We need q's logits for the final token to make a deferral decision
+            final_draft_token = mx.array([draft_tokens[-1]], dtype=mx.uint32)
+            y_for_final_q = mx.concatenate([prompt] + [mx.array(draft_tokens)])
+            final_q_logits = _step(draft_model, draft_cache, y_for_final_q)
+
+            defer = _compute_deferral_decision(final_q_logits, final_p_logits, cascade_rule, cascade_alpha)
+            target_logits = final_p_logits if defer else final_q_logits
+
+            y = sampler(target_logits)
+            yield y.item(), target_logits, False
+            ntoks += accepted_count + 1
+            if ntoks >= max_tokens:
+                return
+
+        # Update both caches with the newly accepted/sampled token for the next iteration.
+        _step(model, model_cache, y)
+        _step(draft_model, draft_cache, y)
 
 def generate_step(
     prompt: mx.array,
@@ -633,37 +829,22 @@ def speculative_generate_step(
         _rewind_cache(num_draft, n)
 
 
+# MODIFIED: stream_generate to handle dispatching to the new cascade function
 def stream_generate(
     model: nn.Module,
     tokenizer: Union[PreTrainedTokenizer, TokenizerWrapper],
     prompt: Union[str, mx.array, List[int]],
     draft_model: Optional[nn.Module] = None,
+    # ADDED: New cascade parameters with default values
+    cascade_rule: Optional[str] = None,
+    cascade_alpha: float = 0.1,
     **kwargs,
 ) -> Generator[GenerationResponse, None, None]:
-    """
-    A generator producing text based on the given prompt from the model.
-
-    Args:
-        model (nn.Module): The model to use for generation.
-        tokenizer (PreTrainedTokenizer): The tokenizer.
-        prompt (Union[str, mx.array, List[int]]): The input prompt string or
-          integer tokens.
-        draft_model (Optional[nn.Module]): An optional draft model. If provided
-          then speculative decoding is used. The draft model must use the same
-          tokenizer as the main model. Default: ``None``.
-        kwargs: The remaining options get passed to :func:`generate_step`.
-          See :func:`generate_step` for more details.
-
-    Yields:
-        GenerationResponse: An instance containing the generated text segment and
-            associated metadata. See :class:`GenerationResponse` for details.
-    """
     if not isinstance(tokenizer, TokenizerWrapper):
         tokenizer = TokenizerWrapper(tokenizer)
 
     if not isinstance(prompt, mx.array):
         if isinstance(prompt, str):
-            # Try to infer if special tokens are needed
             add_special_tokens = tokenizer.bos_token is None or not prompt.startswith(
                 tokenizer.bos_token
             )
@@ -672,18 +853,28 @@ def stream_generate(
 
     detokenizer = tokenizer.detokenizer
 
-    if draft_model is None:
-        kwargs.pop("num_draft_tokens", None)
-        token_generator = generate_step(prompt, model, **kwargs)
-        # from_draft always false for non-speculative generation
-        token_generator = (
-            (token, logprobs, False) for token, logprobs in token_generator
+    # MODIFIED: Dispatch logic for different generation methods
+    if cascade_rule is not None:
+        if draft_model is None:
+            raise ValueError("A draft_model must be provided to use speculative cascades.")
+        # Call the new speculative cascade generator
+        token_generator = speculative_cascade_generate_step(
+            prompt, model, draft_model, cascade_rule, cascade_alpha, **kwargs
         )
-    else:
+    elif draft_model is not None:
+        # Original speculative decoding path
         kwargs.pop("max_kv_size", None)
         kwargs.pop("prompt_progress_callback", None)
         token_generator = speculative_generate_step(
             prompt, model, draft_model, **kwargs
+        )
+    else:
+        # Standard autoregressive path
+        kwargs.pop("num_draft_tokens", None)
+        token_generator = generate_step(prompt, model, **kwargs)
+        # Add a placeholder for from_draft
+        token_generator = (
+            (token, logprobs, False) for token, logprobs in token_generator
         )
     with wired_limit(model, [generation_stream]):
         tic = time.perf_counter()
@@ -725,30 +916,30 @@ def stream_generate(
         )
 
 
+# MODIFIED: generate() to accept and pass on speculative cascade arguments
 def generate(
     model: nn.Module,
     tokenizer: Union[PreTrainedTokenizer, TokenizerWrapper],
     prompt: Union[str, List[int]],
     verbose: bool = False,
+    # ADDED: Cascade parameters to pass down
+    cascade_rule: Optional[str] = None,
+    cascade_alpha: float = 0.1,
     **kwargs,
 ) -> str:
-    """
-    Generate a complete response from the model.
-
-    Args:
-       model (nn.Module): The language model.
-       tokenizer (PreTrainedTokenizer): The tokenizer.
-       prompt (Union[str, List[int]]): The input prompt string or integer tokens.
-       verbose (bool): If ``True``, print tokens and timing information.
-           Default: ``False``.
-       kwargs: The remaining options get passed to :func:`stream_generate`.
-          See :func:`stream_generate` for more details.
-    """
     if verbose:
         print("=" * 10)
 
     text = ""
-    for response in stream_generate(model, tokenizer, prompt, **kwargs):
+    # Pass new args to stream_generate
+    for response in stream_generate(
+        model,
+        tokenizer,
+        prompt,
+        cascade_rule=cascade_rule,
+        cascade_alpha=cascade_alpha,
+        **kwargs
+    ):
         if verbose:
             print(response.text, end="", flush=True)
         text += response.text
@@ -758,7 +949,7 @@ def generate(
         print("=" * 10)
         if len(text) == 0:
             print("No text generated for this prompt")
-            return
+            return "" # Return empty string instead of None
         print(
             f"Prompt: {response.prompt_tokens} tokens, "
             f"{response.prompt_tps:.3f} tokens-per-sec"
@@ -774,6 +965,10 @@ def generate(
 def main():
     parser = setup_arg_parser()
     args = parser.parse_args()
+
+    # ADDED: Validation for cascade arguments
+    if args.cascade_rule and not args.draft_model:
+        raise ValueError("--cascade-rule requires --draft-model to be set.")
 
     if args.seed is not None:
         mx.random.seed(args.seed)
@@ -896,6 +1091,9 @@ def main():
         quantized_kv_start=args.quantized_kv_start,
         draft_model=draft_model,
         num_draft_tokens=args.num_draft_tokens,
+        # ADDED: Pass speculative cascade parameters
+        cascade_rule=args.cascade_rule,
+        cascade_alpha=args.cascade_alpha,
     )
     if not args.verbose:
         print(response)

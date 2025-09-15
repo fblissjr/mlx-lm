@@ -4,6 +4,7 @@ import argparse
 
 import mlx.core as mx
 
+# The core generation logic is now imported from generate.py
 from .generate import stream_generate
 from .models.cache import make_prompt_cache
 from .sample_utils import make_sampler
@@ -79,6 +80,33 @@ def setup_arg_parser():
         default=None,
         help="System prompt to be used for the chat template",
     )
+
+    # ADDED: New arguments for speculative decoding and cascades, mirroring generate.py
+    parser.add_argument(
+        "--draft-model",
+        type=str,
+        help="A model to be used for speculative decoding or speculative cascades.",
+        default=None,
+    )
+    parser.add_argument(
+        "--num-draft-tokens",
+        type=int,
+        help="Number of tokens to draft when using speculative methods.",
+        default=3,
+    )
+    parser.add_argument(
+        "--cascade-rule",
+        type=str,
+        default=None,
+        choices=["chow", "diff", "opt"],
+        help="Enable speculative cascading with the specified deferral rule. Requires --draft-model.",
+    )
+    parser.add_argument(
+        "--cascade-alpha",
+        type=float,
+        default=0.1,
+        help="The alpha threshold ('strictness') for the speculative cascade rule.",
+    )
     return parser
 
 
@@ -86,9 +114,14 @@ def main():
     parser = setup_arg_parser()
     args = parser.parse_args()
 
+    # ADDED: Validation to ensure draft model is provided when a cascade rule is specified.
+    if args.cascade_rule and not args.draft_model:
+        raise ValueError("--cascade-rule requires a --draft-model to be provided.")
+
     if args.seed is not None:
         mx.random.seed(args.seed)
 
+    # MODIFIED: Load both main model and draft model if provided
     model, tokenizer = load(
         args.model,
         adapter_path=args.adapter_path,
@@ -97,6 +130,15 @@ def main():
         },
     )
 
+    draft_model = None
+    if args.draft_model:
+        print(f"[INFO] Loading draft model from {args.draft_model}...")
+        draft_model, draft_tokenizer = load(args.draft_model)
+        if draft_tokenizer.vocab_size != tokenizer.vocab_size:
+            raise ValueError(
+                "The vocabulary of the draft model and main model must be the same."
+            )
+
     def print_help():
         print("The command list:")
         print("- 'q' to exit")
@@ -104,23 +146,41 @@ def main():
         print("- 'h' to display these commands")
 
     print(f"[INFO] Starting chat session with {args.model}.")
+    if args.draft_model:
+        if args.cascade_rule:
+            print(f"[INFO] Using speculative cascade with rule '{args.cascade_rule}' and alpha={args.cascade_alpha}.")
+        else:
+            print("[INFO] Using standard speculative decoding.")
     print_help()
     prompt_cache = make_prompt_cache(model, args.max_kv_size)
+
+    # Add draft model cache if it exists
+    if draft_model:
+        prompt_cache.extend(make_prompt_cache(draft_model, args.max_kv_size))
+
     while True:
         query = input(">> ")
         if query == "q":
             break
         if query == "r":
+            # Reset caches for both models if a draft model is in use
             prompt_cache = make_prompt_cache(model, args.max_kv_size)
+            if draft_model:
+                prompt_cache.extend(make_prompt_cache(draft_model, args.max_kv_size))
+            print("[INFO] Chat history reset.")
             continue
         if query == "h":
             print_help()
             continue
+
         messages = []
         if args.system_prompt is not None:
             messages.append({"role": "system", "content": args.system_prompt})
         messages.append({"role": "user", "content": query})
+
         prompt = tokenizer.apply_chat_template(messages, add_generation_prompt=True)
+
+        # MODIFIED: Pass all new and existing speculative arguments to stream_generate
         for response in stream_generate(
             model,
             tokenizer,
@@ -136,6 +196,10 @@ def main():
                 ),
             ),
             prompt_cache=prompt_cache,
+            draft_model=draft_model,
+            num_draft_tokens=args.num_draft_tokens,
+            cascade_rule=args.cascade_rule,
+            cascade_alpha=args.cascade_alpha,
         ):
             print(response.text, flush=True, end="")
         print()
